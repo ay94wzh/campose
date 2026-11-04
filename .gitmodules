@@ -1,6 +1,6 @@
 [submodule "maniskill_source"]
 	path = maniskill_source
-	url = git@github.com:ripl/ManiSkill.git
+	url = https://github.com/ripl/ManiSkill.git
 [submodule "robosuite_source"]
 	path = robosuite_source
-	url = git@github.com:ripl/robosuite.git
+	url = https://github.com/ripl/robosuite.git
