@@ -16,6 +16,9 @@ from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
+from baseline_data import load_baseline_data
+from baseline_eval import BaselineEvaluator
+from models.baseline import BaselineDiffusionPolicy
 
 import wandb
 
@@ -55,10 +58,16 @@ def main(args, ckpt=None):
     # IMPORTANT: Import after suite.make()
     import OpenGL.GL as gl
 
-    train_dataloader, val_dataloader, stats = load_data(
-        args=args,
-        env=env
-    )
+    if args.policy_class == 'baseline':
+        train_dataloader, val_dataloader, stats = load_baseline_data(
+            args=args,
+            env=env
+        )
+    else:
+        train_dataloader, val_dataloader, stats = load_data(
+            args=args,
+            env=env
+        )
 
     # Save stats
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -66,7 +75,10 @@ def main(args, ckpt=None):
     with open(stats_path, 'w') as f:
         json.dump({k: v.tolist() for k, v in stats.items()}, f, indent=4)
 
-    evaluator = Evaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
+    if args.policy_class == 'baseline':
+        evaluator = BaselineEvaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
+    else:
+        evaluator = Evaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
 
     if args.policy_class == 'act':
         policy = ACTPolicy(args).cuda()
@@ -74,12 +86,18 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
-    
+    elif args.policy_class == 'baseline':
+        policy = BaselineDiffusionPolicy(args).cuda()
+
     optimizer = policy.configure_optimizers()
     if args.policy_class == 'smolvla':
         steps_per_epoch = len(train_dataloader)
         total_steps = args.num_epochs * steps_per_epoch
         scheduler = cosine_schedule_with_warmup(optimizer, 0.05 * total_steps, total_steps)
+    elif args.policy_class == 'baseline':
+        steps_per_epoch = len(train_dataloader)
+        total_steps = args.num_epochs * steps_per_epoch
+        scheduler = cosine_schedule_with_warmup(optimizer, 500, total_steps)
     else:
         scheduler = constant_schedule(optimizer)
     
@@ -120,8 +138,11 @@ def main(args, ckpt=None):
         # Evaluation
         if epoch % args.eval_every == 0:
             policy.eval()
-            for pose_file in args.pose_files:
-                pose_name = pose_file[:-5]  # Remove .json extension
+            if args.policy_class == 'baseline':
+                eval_pose_names = ['agentview']
+            else:
+                eval_pose_names = [pose_file[:-5] for pose_file in args.pose_files]
+            for pose_name in eval_pose_names:
                 eval_save_path = os.path.join(args.ckpt_dir, f"eval_epoch_{epoch}_{pose_name}")
                 os.makedirs(eval_save_path, exist_ok=True)
                 evaluator.success_by_seed = {}
@@ -206,7 +227,7 @@ if __name__ == '__main__':
                         help='Path to camera poses directory (absolute). If None, defaults to policy_robosuite/camera_poses')
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
-    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla'], help='policy class')
+    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','baseline'], help='policy class')
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
