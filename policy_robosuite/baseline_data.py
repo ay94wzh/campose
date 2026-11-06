@@ -29,10 +29,10 @@ from baseline_common import (
     c2w_from_pos_quat,
     eef_hist_to_cam,
     eef_state,
+    find_eef_body_name,
     find_eef_site_id,
     find_gripper_qpos_indices,
     history_indices,
-    mat_to_quat_wxyz,
     quat_xyzw_to_wxyz,
     quat_wxyz_to_mat,
     shared_crop_params,
@@ -44,14 +44,16 @@ from utils import EpisodicDataset, get_norm_stats
 def _eef_from_states(states, env):
     """Fallback: recover EEF pos/quat/grip by replaying flattened states."""
     site_id = find_eef_site_id(env)
+    body_name = find_eef_body_name(env)
     grip_idx = find_gripper_qpos_indices(env)
     pos, quat, grip = [], [], []
     for state in states:
         env.sim.set_state_from_flattened(state)
         env.sim.forward()
         pos.append(env.sim.data.site_xpos[site_id].copy())
-        xmat = env.sim.data.site_xmat[site_id].reshape(3, 3)
-        quat.append(mat_to_quat_wxyz(xmat))
+        # The HDF5 ``robot0_eef_quat`` comes from the EEF body (wxyz in
+        # MuJoCo), not from the gripper site.
+        quat.append(env.sim.data.get_body_xquat(body_name).copy())
         grip.append(env.sim.data.qpos[grip_idx].copy())
     return (
         np.stack(pos).astype(np.float32),

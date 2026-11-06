@@ -28,9 +28,9 @@ from baseline_common import (
     cam_c2w_to_pos_quat,
     eef_hist_to_cam,
     eef_state,
+    find_eef_body_name,
     find_eef_site_id,
     find_gripper_qpos_indices,
-    mat_to_quat_wxyz,
 )
 from eval import Evaluator, to_mp4
 
@@ -46,6 +46,7 @@ class BaselineEvaluator(Evaluator):
         self.num_side_cam = 1
 
         self.eef_site_id = find_eef_site_id(self.env)
+        self.eef_body_name = find_eef_body_name(self.env)
         self.gripper_qpos_idx = find_gripper_qpos_indices(self.env)
 
         self.agentview_cam_id = self.env.sim.model.camera_name2id("agentview")
@@ -87,8 +88,9 @@ class BaselineEvaluator(Evaluator):
     # ------------------------------------------------------------- observations
     def _current_eef_raw(self):
         pos = self.env.sim.data.site_xpos[self.eef_site_id].copy()
-        xmat = self.env.sim.data.site_xmat[self.eef_site_id].reshape(3, 3)
-        quat_wxyz = mat_to_quat_wxyz(xmat)
+        # Match training: robot0_eef_quat is the EEF *body* quaternion
+        # (MuJoCo order wxyz), not the gripper-site orientation.
+        quat_wxyz = self.env.sim.data.get_body_xquat(self.eef_body_name).copy()
         grip = self.env.sim.data.qpos[self.gripper_qpos_idx].copy()
         return pos, quat_wxyz, grip
 

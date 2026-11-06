@@ -254,11 +254,31 @@ def find_eef_site_id(env) -> int:
     raise RuntimeError("could not locate the EEF site; pass an explicit site id")
 
 
+def find_eef_body_name(env) -> str:
+    """Name of the robot's EEF body.
+
+    Robosuite's ``robot0_eef_quat`` observation (the key stored in the demo
+    HDF5s and used for training) is the *body* quaternion from
+    ``sim.data.get_body_xquat``, not the gripper-site orientation.  Evaluation
+    must use the same body or the EEF state/history is ~90 degrees off.
+    """
+    robot = env.robots[0]
+    names = getattr(robot.robot_model, "eef_name", None)
+    if isinstance(names, dict):
+        names = next(iter(names.values()), None)
+    if names is None:
+        raise RuntimeError("could not locate the EEF body name")
+    return str(names)
+
+
 def find_gripper_qpos_indices(env) -> np.ndarray:
     """Indices of the two gripper joints in ``sim.data.qpos``."""
     robot = env.robots[0]
     idx = getattr(robot, "_ref_gripper_joint_pos_indexes", None)
+    if isinstance(idx, dict):
+        # This robosuite fork stores per-arm index lists keyed by arm name.
+        idx = next(iter(idx.values()), None)
     if idx is not None:
-        return np.asarray(idx, dtype=np.int64)
+        return np.asarray(idx, dtype=np.int64).reshape(-1)
     # Panda: 7 arm joints followed by 2 gripper joints.
     return np.arange(7, 9, dtype=np.int64)

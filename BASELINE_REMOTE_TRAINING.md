@@ -201,7 +201,7 @@ python policy_robosuite/train.py \
   --dataset_suffix liftrand_eef_delta \
   --num_side_cam 1 --n 3 --m 1 \
   --batch_size 32 --seed 0 \
-  --num_epochs 100001 --eval_start_epoch 60000 --eval_every 2000 --eval_max_steps 600 \
+  --num_epochs 1001 --eval_start_epoch 600 --eval_every 50 --eval_max_steps 600 \
   --lr 1e-4 --weight_decay 1e-6
 ```
 
@@ -215,7 +215,7 @@ python policy_robosuite/train.py \
   --dataset_suffix canrand_eef_delta \
   --num_side_cam 2 --n 4 --m 2 \
   --batch_size 32 --seed 0 \
-  --num_epochs 100001 --eval_start_epoch 60000 --eval_every 2000 --eval_max_steps 600 \
+  --num_epochs 1001 --eval_start_epoch 600 --eval_every 50 --eval_max_steps 600 \
   --lr 1e-4 --weight_decay 1e-6
 ```
 
@@ -229,7 +229,7 @@ python policy_robosuite/train.py \
   --dataset_suffix squarerand_eef_delta \
   --num_side_cam 2 --n 4 --m 2 \
   --batch_size 32 --seed 0 \
-  --num_epochs 100001 --eval_start_epoch 60000 --eval_every 2000 --eval_max_steps 600 \
+  --num_epochs 1001 --eval_start_epoch 600 --eval_every 50 --eval_max_steps 600 \
   --lr 1e-4 --weight_decay 1e-6
 ```
 
