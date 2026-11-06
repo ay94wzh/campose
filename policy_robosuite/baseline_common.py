@@ -1,17 +1,22 @@
 """Simulator-free helpers for the `baseline` method.
 
-The `baseline` policy is the exact B1 encoder (variant A, no residual token
-branch) attached to a diffusion-policy UNet.  This module holds only the
-geometry, indexing, cropping and normalisation helpers shared by the dataset,
-the evaluator and the CPU tests.  Nothing here imports robosuite or mani_skill.
+The `baseline` policy is a B1-style encoder (spatial-softmax pooling, no
+residual token branch) attached to a diffusion-policy UNet.  This module holds
+only the geometry, indexing, cropping and normalisation helpers shared by the
+dataset, the evaluator and the CPU tests.  Nothing here imports robosuite or
+mani_skill.
 
 Conventions
 -----------
 * Quaternions are handled in **wxyz** order unless a function name says
   otherwise.  Robosuite's HDF5 observations store xyzw, so the dataset converts
   once at load time.
-* The 9-D low-dim state is ``[pos(3), quat_wxyz(4), gripper(2)]``, matching the
-  B1 reference's sorted low-dim keys.
+* RGB is fed as ``rgb / 255`` with **no** ImageNet normalisation, matching the
+  original DP's ``RgbEncoder``; Plucker channels are raw.
+* The 7-D proprio is the robot joint positions (the first 7 dims of the
+  flattened MuJoCo state), matching the original DP's ``qpos``.  It is zeroed
+  with ``prob_drop_proprio`` **before** the DP min-max normalisation (default
+  ``1.0`` = always dropped, i.e. the constant ``-state_mean / state_std``).
 * The 4-step camera-frame EEF history per step is
   ``[R_c^T (p - cam_pos) (3), rot6d(R_c^T R_eef) (6), gripper (2)]`` = 11 dims,
   step-major and oldest-first -> 44 dims.
@@ -19,11 +24,12 @@ Conventions
 from __future__ import annotations
 
 import random
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from scipy.spatial.transform import Rotation
 
@@ -33,18 +39,19 @@ from scipy.spatial.transform import Rotation
 EEF_STEP_DIM = 11
 EEF_HIST_STEPS = 4
 EEF_HIST_DIM = EEF_STEP_DIM * EEF_HIST_STEPS  # 44
-EEF_STATE_DIM = 9
+PROPRIO_DIM = 7  # robot joint positions, matching the original DP's qpos
 FUSED_DIM = 512
-OBS_FEATURE_DIM = 521
+OBS_FEATURE_DIM = FUSED_DIM + PROPRIO_DIM  # 519
 HORIZON = 16
-N_OBS_STEPS = 2
+N_OBS_STEPS = 1  # DP parity: a single observation frame
 N_ACTION_STEPS = 8
 IMAGE_SIZE = 256
 CROP_MIN_SIDE = int(IMAGE_SIZE * 0.8)  # 204, mirrors CamPose's RandomCrop
 CROP_MAX_SIDE = IMAGE_SIZE
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+# Bump whenever the encoder or input normalisation changes; stored in every
+# baseline checkpoint so stale weights cannot be resumed silently.
+BASELINE_ARCH = "spatial_softmax_nobs1_proprio7_v1"
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +124,20 @@ def c2w_from_pos_quat(pos, quat_wxyz):
 
 
 # ---------------------------------------------------------------------------
-# EEF state / history
+# Proprio / EEF history
 # ---------------------------------------------------------------------------
-def eef_state(eef_pos, quat_wxyz, grip):
-    """(..., 3), (..., 4), (..., 2) -> (..., 9) in ``[pos, quat, grip]`` order."""
-    return np.concatenate(
-        [np.asarray(eef_pos), np.asarray(quat_wxyz), np.asarray(grip)], axis=-1
-    )
+def normalize_proprio(raw, mean, std, drop: bool = False):
+    """Zero the raw proprio, then apply the DP min-max normalisation.
+
+    Mirrors ``utils.py``/``eval.py``: ``prob_drop_proprio`` is applied to the
+    raw qpos *before* ``(qpos - state_mean) / state_std``.  With ``drop=True``
+    the result is the constant ``-mean / std``, exactly what the original DP
+    feeds as ``local_cond`` under its default ``prob_drop_proprio=1.0``.
+    """
+    raw = np.asarray(raw, dtype=np.float32)
+    if drop:
+        raw = np.zeros_like(raw)
+    return (raw - mean) / std
 
 
 def eef_hist_to_cam(eef_pos, eef_quat_wxyz, grip, cam_pos, cam_quat_wxyz):
@@ -139,25 +153,61 @@ def eef_hist_to_cam(eef_pos, eef_quat_wxyz, grip, cam_pos, cam_quat_wxyz):
     return np.concatenate([p, mat_to_rot6d(R_rel), np.asarray(grip, dtype=np.float64)])
 
 
+def eef_hist_array(eef_pos, eef_quat_wxyz, grip, cam_pos, cam_quat_wxyz,
+                   steps: int = EEF_HIST_STEPS) -> np.ndarray:
+    """Vectorised history over a whole episode -> ``(T, steps * 11)``.
+
+    Row ``t`` is the concatenation of the ``steps`` history entries ending at
+    ``t`` (oldest first, clipped at the episode start), exactly what
+    ``history_indices``/``eef_hist_to_cam`` produce one step at a time.  Only
+    indices ``<= t`` are read, so no future frame enters the encoder; used to
+    compute the per-dimension normalisation statistics of the FiLM input.
+    """
+    eef_pos = np.asarray(eef_pos, dtype=np.float64)
+    eef_quat_wxyz = np.asarray(eef_quat_wxyz, dtype=np.float64)
+    grip = np.asarray(grip, dtype=np.float64)
+    t = np.arange(len(eef_pos), dtype=np.int64)
+    idx = np.clip(
+        t[:, None] - steps + 1 + np.arange(steps, dtype=np.int64)[None, :],
+        0,
+        t[:, None],
+    )
+    pos_h = eef_pos[idx]                 # (T, S, 3)
+    quat_h = eef_quat_wxyz[idx]          # (T, S, 4)
+    grip_h = grip[idx]                   # (T, S, 2)
+    R_c = quat_wxyz_to_mat(np.asarray(cam_quat_wxyz, dtype=np.float64))
+    R_e = quat_wxyz_to_mat(quat_h)       # (T, S, 3, 3)
+    p_cam = (pos_h - np.asarray(cam_pos, dtype=np.float64)) @ R_c
+    R_rel = np.einsum("ij,...jk->...ik", R_c.T, R_e)
+    rot6d = np.concatenate([R_rel[..., 0, :], R_rel[..., 1, :]], axis=-1)
+    return np.concatenate([p_cam, rot6d, grip_h], axis=-1).reshape(len(t), -1)
+
+
 # ---------------------------------------------------------------------------
 # Indexing helpers
 # ---------------------------------------------------------------------------
 def history_indices(t_obs: int, steps: int = EEF_HIST_STEPS) -> np.ndarray:
-    """The ``steps`` history indices ending at ``t_obs``, clipped at episode start."""
+    """The ``steps`` history indices ending at ``t_obs``, clipped at episode start.
+
+    Every returned index is ``<= t_obs``: the FiLM history is past-only and no
+    future frame enters the encoder.
+    """
     idx = np.arange(t_obs - steps + 1, t_obs + 1, dtype=np.int64)
     return np.clip(idx, 0, t_obs)
 
 
 def action_window_indices(t: int, horizon: int = HORIZON, length: int = None):
-    """Action window used by B1: starts at ``t-1`` and spans ``horizon`` steps.
+    """Action window for one observation at ``t``: ``[t, t + horizon)``.
 
+    With ``N_OBS_STEPS = 1`` (DP parity) the first predicted action is the one
+    applied from the observed state, matching ``utils.py``'s ``actions[t:]``.
     Returns ``(safe_indices, valid)``.  ``safe_indices`` clips out-of-range
     entries so callers can index safely; ``valid`` marks the entries that are
-    within the episode.  The first entry is invalid only when ``t == 0``.
+    within the episode.
     """
     if length is None:
         raise ValueError("length is required")
-    start = int(t) - 1
+    start = int(t)
     idx = start + np.arange(horizon, dtype=np.int64)
     valid = (idx >= 0) & (idx < int(length))
     safe = np.clip(idx, 0, max(int(length) - 1, 0))
@@ -231,6 +281,48 @@ def replace_bn_with_gn(root_module: nn.Module) -> nn.Module:
             num_groups=max(1, m.num_features // 16), num_channels=m.num_features
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Spatial softmax (copied from models/dp.py)
+# ---------------------------------------------------------------------------
+class SpatialSoftmax(nn.Module):
+    """Expected (x, y) of each feature channel's activation mass.
+
+    Copied from ``models/dp.py`` to keep this module diffusers-free (that file
+    imports ``diffusers`` at module scope).  With ``num_kp=None`` each input
+    channel is a keypoint; otherwise a 1x1 conv maps ``C -> num_kp``.
+    """
+
+    def __init__(self, input_shape, num_kp: Optional[int] = 32):
+        super().__init__()
+        c, h, w = input_shape
+        self._in_c, self._in_h, self._in_w = c, h, w
+        if num_kp is not None:
+            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = self._in_c
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1.0, 1.0, self._in_w),
+            np.linspace(-1.0, 1.0, self._in_h),
+        )
+        pos_x = torch.from_numpy(
+            pos_x.reshape(self._in_h * self._in_w, 1)
+        ).float()
+        pos_y = torch.from_numpy(
+            pos_y.reshape(self._in_h * self._in_w, 1)
+        ).float()
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if self.nets is not None:
+            features = self.nets(features)
+        features = features.reshape(-1, self._in_h * self._in_w)
+        attention = F.softmax(features, dim=-1)
+        expected_xy = attention @ self.pos_grid
+        return expected_xy.view(-1, self._out_c, 2)
 
 
 # ---------------------------------------------------------------------------

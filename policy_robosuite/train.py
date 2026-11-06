@@ -16,6 +16,7 @@ from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
+from baseline_common import BASELINE_ARCH
 from baseline_data import load_baseline_data
 from baseline_eval import BaselineEvaluator
 from models.baseline import BaselineDiffusionPolicy
@@ -114,7 +115,9 @@ def main(args, ckpt=None):
     
     pbar = tqdm.tqdm(total=args.num_epochs, desc="Training")
     pbar.update(epoch)
-    
+
+    epoch_summary = None       # set by validation, then by training
+    last_train_summary = None  # survives a resume; None before the first epoch
     while epoch < args.num_epochs:
         
         # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
@@ -167,13 +170,22 @@ def main(args, ckpt=None):
         # Save checkpoint
         if epoch % args.save_every == 0:
             checkpoint_path = os.path.join(args.ckpt_dir, f'epoch_{epoch}.pth')
+            # Prefer the last training loss; before the first training step
+            # (epoch 0, or right after a resume) fall back to validation.
+            summary = (
+                last_train_summary
+                if last_train_summary is not None
+                else epoch_summary
+            )
             torch.save({
-                'epoch': epoch, 
+                'epoch': epoch,
                 'model_state_dict': policy.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'loss': epoch_summary['loss'], 
-                'wandb_id': wandb.run.id
+                'loss': summary['loss'] if summary is not None else None,
+                'wandb_id': wandb.run.id,
+                'eef_hist_norm': True,
+                'baseline_arch': BASELINE_ARCH,
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
@@ -203,6 +215,7 @@ def main(args, ckpt=None):
             train_history.append(detach_dict(forward_dict))
         
         epoch_summary = compute_dict_mean(train_history)
+        last_train_summary = epoch_summary
         for k, v in epoch_summary.items():
             wandb.log({f'train_{k}': v.item()}, step=epoch)
 
@@ -319,6 +332,19 @@ if __name__ == '__main__':
     if ckpt_path is not None:
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path)
+        if args.policy_class == 'baseline' and not ckpt.get('eef_hist_norm', False):
+            raise RuntimeError(
+                "This baseline checkpoint predates EEF-history normalisation; "
+                "resuming would silently change the FiLM input scale. "
+                "Retrain with a fresh --name."
+            )
+        if args.policy_class == 'baseline' and ckpt.get('baseline_arch') != BASELINE_ARCH:
+            raise RuntimeError(
+                "This baseline checkpoint was trained with a different encoder "
+                "architecture (checkpoint 'baseline_arch' != "
+                f"{BASELINE_ARCH!r}); its state_dict is incompatible. Retrain "
+                "with a fresh --name."
+            )
         wandb_id = ckpt['wandb_id']
         wandb.init(project='test', id=wandb_id, resume='must', group=group)
         main(args, ckpt)

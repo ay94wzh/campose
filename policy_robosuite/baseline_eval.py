@@ -5,8 +5,8 @@ the full action chunk.  The baseline has two extra requirements:
 
 * fixed **agentview**, K=1, including a real Plucker map (the original
   evaluator emits zero Plucker for ``default_cam``),
-* a two-frame observation buffer and a 4-step EEF history, updated at every
-  environment step so each replan sees the last two consecutive sim steps.
+* a single-frame observation buffer (DP ``n_obs_steps=1``) and a 4-step EEF
+  history, updated at every environment step.
 
 The class subclasses ``Evaluator`` and overrides only ``evaluate``; ``eval.py``
 is untouched.  It restores the default agentview before every episode because
@@ -25,12 +25,13 @@ from baseline_common import (
     EEF_HIST_STEPS,
     N_ACTION_STEPS,
     N_OBS_STEPS,
+    PROPRIO_DIM,
     cam_c2w_to_pos_quat,
     eef_hist_to_cam,
-    eef_state,
     find_eef_body_name,
     find_eef_site_id,
     find_gripper_qpos_indices,
+    normalize_proprio,
 )
 from eval import Evaluator, to_mp4
 
@@ -61,8 +62,10 @@ class BaselineEvaluator(Evaluator):
         )
         self.agentview_plucker = self._compute_plucker(self.agentview_c2w)
 
-        self.eef_mean = self.norm_stats["eef_mean"].cpu().numpy()
-        self.eef_std = self.norm_stats["eef_std"].cpu().numpy()
+        self.state_mean = self.norm_stats["state_mean"].cpu().numpy()
+        self.state_std = self.norm_stats["state_std"].cpu().numpy()
+        self.eef_hist_mean = self.norm_stats["eef_hist_mean"].cpu().numpy()
+        self.eef_hist_std = self.norm_stats["eef_hist_std"].cpu().numpy()
         self.action_mean = self.norm_stats["action_mean"].cpu().numpy()
         self.action_std = self.norm_stats["action_std"].cpu().numpy()
 
@@ -111,14 +114,13 @@ class BaselineEvaluator(Evaluator):
 
         cam_pos, cam_quat_wxyz = cam_c2w_to_pos_quat(self.agentview_c2w)
         hist = self._eef_history(eef_deque, cam_pos, cam_quat_wxyz)
-
-        pos, quat_wxyz, grip = self._current_eef_raw()
-        eef = (eef_state(pos, quat_wxyz, grip) - self.eef_mean) / self.eef_std
+        hist = (hist - self.eef_hist_mean) / self.eef_hist_std
 
         return {
             "rgb": rgb,
             "image": image.unsqueeze(0),  # (1, 9, H, W)
-            "eef_state": torch.from_numpy(eef.astype(np.float32)).to(self.device),
+            # Raw qpos; the dropout and normalisation happen once per replan.
+            "proprio_raw": self.env.sim.data.qpos[:PROPRIO_DIM].copy(),
             "eef_hist": torch.from_numpy(hist).to(self.device).unsqueeze(0),
             "view_mask": torch.ones(1, dtype=torch.bool, device=self.device),
         }
@@ -133,7 +135,31 @@ class BaselineEvaluator(Evaluator):
         init_state=None,
         episode_num=0,
     ):
+        # Deterministic object placement per episode, without leaking the seed
+        # into the global stream used by the training data sampler.
+        state = np.random.get_state()
         np.random.seed(episode_num)
+        try:
+            return self._evaluate_impl(
+                policy,
+                save_path,
+                video_prefix,
+                pose_name,
+                init_state,
+                episode_num,
+            )
+        finally:
+            np.random.set_state(state)
+
+    def _evaluate_impl(
+        self,
+        policy,
+        save_path,
+        video_prefix,
+        pose_name,
+        init_state=None,
+        episode_num=0,
+    ):
         self._restore_agentview()
         if init_state is not None:
             self.env.reset()
@@ -150,7 +176,7 @@ class BaselineEvaluator(Evaluator):
             [(pos, quat_wxyz, grip)] * EEF_HIST_STEPS, maxlen=EEF_HIST_STEPS
         )
         snap = self._snapshot(eef_deque)
-        snapshots = deque([snap, snap], maxlen=N_OBS_STEPS)
+        snapshots = deque([snap], maxlen=N_OBS_STEPS)
 
         camera_frames = [snap["rgb"]]
         success_labels = [False]
@@ -162,16 +188,21 @@ class BaselineEvaluator(Evaluator):
         while not done and step < self.max_steps:
             image = torch.stack(
                 [s["image"] for s in snapshots], dim=0
-            ).unsqueeze(0)  # (1, 2, 1, 9, H, W)
-            eef_state_t = torch.stack(
-                [s["eef_state"] for s in snapshots], dim=0
-            ).unsqueeze(0)  # (1, 2, 9)
+            ).unsqueeze(0)  # (1, To, 1, 9, H, W)
+            raw_proprio = np.stack(
+                [s["proprio_raw"] for s in snapshots], axis=0
+            )  # (To, 7)
+            drop_proprio = np.random.rand() < self.args.prob_drop_proprio
+            proprio = normalize_proprio(
+                raw_proprio, self.state_mean, self.state_std, drop_proprio
+            )
+            proprio_t = torch.from_numpy(proprio).to(self.device).unsqueeze(0)
             eef_hist_t = torch.stack(
                 [s["eef_hist"] for s in snapshots], dim=0
-            ).unsqueeze(0)  # (1, 2, 1, 44)
+            ).unsqueeze(0)  # (1, To, 1, 44)
             view_mask_t = torch.stack(
                 [s["view_mask"] for s in snapshots], dim=0
-            ).unsqueeze(0)  # (1, 2, 1)
+            ).unsqueeze(0)  # (1, To, 1)
 
             generator = torch.Generator(device=self.device)
             generator.manual_seed((episode_num + 1) * 100003 + step)
@@ -184,7 +215,7 @@ class BaselineEvaluator(Evaluator):
                 action_chunk = policy(
                     {
                         "image": image,
-                        "eef_state": eef_state_t,
+                        "proprio": proprio_t,
                         "eef_hist": eef_hist_t,
                         "view_mask": view_mask_t,
                     },

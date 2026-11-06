@@ -4,15 +4,20 @@ The class subclasses CamPose's ``EpisodicDataset`` so the camera-pose JSONs,
 the n/m window sampling, the MuJoCo rendering and the Plucker embedder are all
 reused unchanged.  Only the per-sample construction differs:
 
-* two consecutive observation frames (``t-1``, ``t``) with one shared camera
-  pose and one shared random crop,
-* a 4-step camera-frame EEF history per view,
-* a 9-D EEF low-dim state,
-* a fixed 16-step action window starting at ``t-1``.
+* one observation frame at ``t`` (DP ``n_obs_steps=1``),
+* a 4-step camera-frame EEF history per view (past-only: every index is
+  ``<= t``; no future frame enters the encoder),
+* a 7-D joint-position proprio (the first 7 dims of the flattened MuJoCo
+  state) zeroed with ``prob_drop_proprio`` before normalisation, matching the
+  original DP,
+* a fixed 16-step action window starting at ``t``.
 
 No original file is modified.
 """
 from __future__ import annotations
+
+import json
+import os
 
 import h5py
 import numpy as np
@@ -23,16 +28,18 @@ from baseline_common import (
     EEF_HIST_STEPS,
     HORIZON,
     IMAGE_SIZE,
+    PROPRIO_DIM,
     action_window_indices,
     apply_shared_crop,
     cam_c2w_to_pos_quat,
     c2w_from_pos_quat,
+    eef_hist_array,
     eef_hist_to_cam,
-    eef_state,
     find_eef_body_name,
     find_eef_site_id,
     find_gripper_qpos_indices,
     history_indices,
+    normalize_proprio,
     quat_xyzw_to_wxyz,
     quat_wxyz_to_mat,
     shared_crop_params,
@@ -81,7 +88,7 @@ def _read_eef_obs(dataset_file, demo_idx, states, env=None):
 
 
 class BaselineEpisodicDataset(EpisodicDataset):
-    """Episodic dataset returning B1's two-frame / history / mask tensors."""
+    """Episodic dataset returning B1's single-frame / history / mask tensors."""
 
     def __init__(
         self,
@@ -111,8 +118,20 @@ class BaselineEpisodicDataset(EpisodicDataset):
         if self.plucker_embedder is None:
             self.plucker_embedder = PluckerEmbedder(img_size=IMAGE_SIZE, device="cuda")
 
-        self.eef_mean = np.asarray(norm_stats["eef_mean"], dtype=np.float32)
-        self.eef_std = np.asarray(norm_stats["eef_std"], dtype=np.float32)
+        self.state_mean = np.asarray(norm_stats["state_mean"], dtype=np.float32)
+        self.state_std = np.asarray(norm_stats["state_std"], dtype=np.float32)
+        for key in ("eef_hist_mean", "eef_hist_std"):
+            if key not in norm_stats:
+                raise KeyError(
+                    f"{key} missing from norm_stats; recompute the baseline "
+                    "statistics with compute_baseline_stats()"
+                )
+        self.eef_hist_mean = np.asarray(
+            norm_stats["eef_hist_mean"], dtype=np.float32
+        )
+        self.eef_hist_std = np.asarray(
+            norm_stats["eef_hist_std"], dtype=np.float32
+        )
         self.action_mean = np.asarray(norm_stats["action_mean"], dtype=np.float32)
         self.action_std = np.asarray(norm_stats["action_std"], dtype=np.float32)
 
@@ -120,6 +139,29 @@ class BaselineEpisodicDataset(EpisodicDataset):
         self.demo_eef_quat_wxyz = []
         self.demo_grip = []
         self._load_eef_arrays()
+        self._report_camera_coverage()
+
+    def _report_camera_coverage(self):
+        """Warn when the n/m windows leave most of the pose set unused."""
+        if self.args.default_cam:
+            return
+        covered = min(
+            len(self.camera_poses),
+            self.args.m * (len(self.demo_indices) - 1) + self.args.n,
+        )
+        if covered < len(self.camera_poses):
+            print(
+                f"[baseline] camera windows cover {covered} of "
+                f"{len(self.camera_poses)} poses "
+                f"(n={self.args.n}, m={self.args.m}, "
+                f"demos={len(self.demo_indices)}); use --n/--m to widen coverage"
+            )
+
+    def __del__(self):
+        # ``self.env`` is shared with the sibling dataset and the evaluator.
+        # ``EpisodicDataset.__del__`` closes it on garbage collection; here the
+        # trainer owns the env and closes it explicitly.
+        pass
 
     def _load_eef_arrays(self):
         with h5py.File(self.args.dataset_path, "r") as f:
@@ -151,7 +193,7 @@ class BaselineEpisodicDataset(EpisodicDataset):
         return c2w_from_pos_quat(pos, quat_wxyz)
 
     def _render_slot_pair(self, states, obs_indices, pose_raw):
-        """Render both observation frames for one view with one camera pose."""
+        """Render the observation frame(s) for one view with one camera pose."""
         if pose_raw is not None:
             self._set_camera_pose(np.asarray(pose_raw, dtype=np.float32))
         c2w = self._slot_c2w(pose_raw)
@@ -189,9 +231,15 @@ class BaselineEpisodicDataset(EpisodicDataset):
         states = self.demo_states[demo_idx]
         actions = self.demo_actions[demo_idx]
         t = int(np.random.randint(demo_length))
-        obs_indices = np.array([max(t - 1, 0), t], dtype=np.int64)
+        # DP n_obs_steps=1: a single observation frame at t.  The action
+        # window below starts at t, so it is strictly future relative to it.
+        obs_indices = np.array([t], dtype=np.int64)
 
         if not self.args.default_cam:
+            # ``demo_idx`` is positional (the DataLoader index).  Training
+            # indices are 0..N-1, so this equals the global demo index; the
+            # val split reuses the start of the (smaller) test pose file
+            # instead of overflowing it.
             start = self.args.m * demo_idx
             end = start + self.args.n
             window = np.arange(start, end, dtype=np.int64)
@@ -202,14 +250,15 @@ class BaselineEpisodicDataset(EpisodicDataset):
         else:
             pose_set = [None] * self.num_cameras
 
-        eef_states = []
-        for frame_idx in obs_indices:
-            raw = eef_state(
-                self.demo_eef_pos[demo_idx][frame_idx],
-                self.demo_eef_quat_wxyz[demo_idx][frame_idx],
-                self.demo_grip[demo_idx][frame_idx],
-            )
-            eef_states.append((raw - self.eef_mean) / self.eef_std)
+        # prob_drop_proprio mirrors the original DP: zero the raw qpos before
+        # the min-max normalisation.  One draw per sample (n_obs_steps=1).
+        drop_proprio = np.random.rand() < self.args.prob_drop_proprio
+        proprio = normalize_proprio(
+            states[t][:PROPRIO_DIM],
+            self.state_mean,
+            self.state_std,
+            drop_proprio,
+        )
 
         slot_images = []
         slot_hists = []
@@ -233,14 +282,14 @@ class BaselineEpisodicDataset(EpisodicDataset):
                 per_frame_hist.append(np.concatenate(hist_steps, axis=0))
             slot_hists.append(np.stack(per_frame_hist, axis=0))
 
-        image = torch.stack(slot_images, dim=1)  # (2, K, 9, H, W)
-        eef_state_t = torch.tensor(
-            np.stack(eef_states, axis=0), dtype=torch.float32
-        )  # (2, 9)
+        image = torch.stack(slot_images, dim=1)  # (1, K, 9, H, W)
+        proprio_t = torch.from_numpy(proprio).float()[None]  # (1, 7)
         eef_hist_t = torch.tensor(
-            np.stack(slot_hists, axis=1), dtype=torch.float32
-        )  # (2, K, 44)
-        view_mask = torch.ones(2, self.num_cameras, dtype=torch.bool)
+            (np.stack(slot_hists, axis=1) - self.eef_hist_mean)
+            / self.eef_hist_std,
+            dtype=torch.float32,
+        )  # (1, K, 44), z-scored with the training history stats
+        view_mask = torch.ones(1, self.num_cameras, dtype=torch.bool)
 
         safe_idx, valid = action_window_indices(t, HORIZON, len(actions))
         act = np.zeros((HORIZON, actions.shape[1]), dtype=np.float32)
@@ -250,7 +299,7 @@ class BaselineEpisodicDataset(EpisodicDataset):
 
         return {
             "image": image.cuda(),
-            "eef_state": eef_state_t.cuda(),
+            "proprio": proprio_t.cuda(),
             "eef_hist": eef_hist_t.cuda(),
             "view_mask": view_mask.cuda(),
             "actions": torch.from_numpy(act).float().cuda(),
@@ -258,22 +307,73 @@ class BaselineEpisodicDataset(EpisodicDataset):
         }
 
 
-def compute_baseline_stats(dataset_path, num_demos, env=None):
-    """CamPose DP action stats plus 9-D EEF mean/std."""
+def _load_train_camera_poses(args, env):
+    """Camera poses the training window sampler draws from."""
+    if args.default_cam:
+        if env is None:
+            raise RuntimeError(
+                "default_cam=True needs env to read the agentview pose"
+            )
+        cam_id = env.sim.model.camera_name2id("agentview")
+        pos = env.sim.model.cam_pos[cam_id].copy()
+        quat = env.sim.model.cam_quat[cam_id].copy()
+        return [c2w_from_pos_quat(pos, quat)]
+    poses_path = os.path.join(args.camera_poses_dir, args.train_poses_file)
+    with open(poses_path, "r") as f:
+        return json.load(f)["poses"]
+
+
+def compute_baseline_stats(dataset_path, num_demos, args, env=None):
+    """CamPose DP action/state stats plus 44-D history mean/std.
+
+    ``state_mean/std`` are the DP min-max statistics over the first 7 joint
+    dims (``get_norm_stats``), used for the 7-D proprio.  The history
+    statistics are computed over every demo and every camera pose in that
+    demo's training window, i.e. the marginal distribution the dataset samples
+    from.
+    """
     stats = get_norm_stats(dataset_path, num_demos=num_demos, policy_class="dp")
-    eef_rows = []
+    poses = _load_train_camera_poses(args, env)
+    hist_sum = None
+    hist_sumsq = None
+    hist_count = 0
     with h5py.File(dataset_path, "r") as f:
         demo_keys = [k for k in f["data"].keys() if k.startswith("demo_")]
         count = min(int(num_demos), len(demo_keys))
+        if count == 0:
+            raise RuntimeError("no demos found for baselines statistics")
         for i in range(count):
             states = f[f"data/demo_{i}/states"][()].astype(np.float32)
             pos, quat, grip = _read_eef_obs(f, i, states, env)
-            eef_rows.append(eef_state(pos, quat, grip))
-    if not eef_rows:
-        raise RuntimeError("no demos found for baselines statistics")
-    eef = np.concatenate(eef_rows, axis=0)
-    stats["eef_mean"] = eef.mean(axis=0).astype(np.float32)
-    stats["eef_std"] = np.clip(eef.std(axis=0), 1e-4, np.inf).astype(np.float32)
+
+            if args.default_cam:
+                pose_window = poses[:1]
+            else:
+                start = args.m * i
+                end = start + args.n
+                if end > len(poses):
+                    raise IndexError(
+                        f"demo_{i}: camera window [{start}, {end}) exceeds "
+                        f"the {len(poses)} poses in {args.train_poses_file}"
+                    )
+                pose_window = poses[start:end]
+            for pose in pose_window:
+                cam_pos, cam_quat = cam_c2w_to_pos_quat(np.asarray(pose))
+                hist = eef_hist_array(pos, quat, grip, cam_pos, cam_quat)
+                if hist_sum is None:
+                    hist_sum = np.zeros(hist.shape[1], dtype=np.float64)
+                    hist_sumsq = np.zeros(hist.shape[1], dtype=np.float64)
+                hist_sum += hist.sum(axis=0)
+                hist_sumsq += np.square(hist).sum(axis=0)
+                hist_count += hist.shape[0]
+    if hist_count == 0:
+        raise RuntimeError("no camera poses found for history statistics")
+    hist_mean = hist_sum / hist_count
+    hist_var = hist_sumsq / hist_count - np.square(hist_mean)
+    stats["eef_hist_mean"] = hist_mean.astype(np.float32)
+    stats["eef_hist_std"] = np.clip(
+        np.sqrt(np.clip(hist_var, 0.0, None)), 1e-6, np.inf
+    ).astype(np.float32)
     return stats
 
 
@@ -284,13 +384,17 @@ def load_baseline_data(args, env, val_split=0.1):
             [k for k in f["data"].keys() if k.startswith("demo_")]
         )
     assert args.num_episodes + 10 <= available_demos, "Not enough demos to split"
+    print(
+        f"Using {args.num_episodes} of {available_demos} demos for training "
+        f"(+10 for validation)"
+    )
 
     train_indices = list(range(args.num_episodes))
     val_indices = list(range(args.num_episodes, args.num_episodes + 10))
 
     print("Computing baseline normalization statistics...")
     norm_stats = compute_baseline_stats(
-        args.dataset_path, num_demos=args.num_episodes, env=env
+        args.dataset_path, num_demos=args.num_episodes, args=args, env=env
     )
     print("Normalization statistics computed.")
 

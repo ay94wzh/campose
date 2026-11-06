@@ -1,20 +1,25 @@
-"""Exact B1 encoder (variant A) + diffusion-policy head.
+"""B1-style encoder (spatial-softmax pooling) + diffusion-policy head.
 
-This is the `baseline` method: B1's view-conditioned encoder with no residual
-token branch, attached to the DP UNet used by CamPose.  The encoder follows
-``diffusion_policy/model/vision/view_conditioned_obs_encoder.py``:
+This is the `baseline` method: B1's view-conditioned encoder (no residual token
+branch) with the original DP's input conventions, attached to the DP UNet.
 
-    image (N, K, 9, 256, 256)
+    image (N, K, 9, 256, 256)   # rgb/255 + raw Plucker, no ImageNet norm
       -> shared ResNet18 (no pretrained weights, GroupNorm)
       -> per-stage FiLM from the 4-step camera-frame EEF history
-      -> per-view avgpool -> 512
+      -> per-view spatial-softmax keypoints (32 x 2) -> Linear -> 512
       -> masked cross-view MHA with a learnable query -> 512
-      -> concat 9-D EEF state -> 521
+      -> concat 7-D joint-qpos proprio -> 519
 
-The policy repeats this for ``n_obs_steps=2`` observation frames, flattens to
-1042, and conditions the DP UNet.  Inference returns the 8 actions that
-correspond to ``n_action_steps`` (the DP ``start=n_obs_steps-1`` slice), so
-CamPose's evaluator executes exactly 8 actions and replans.
+The policy uses a single observation frame (DP ``n_obs_steps=1``), so the UNet
+is conditioned on 519 dims.  The proprio is zeroed before normalisation with
+``prob_drop_proprio`` (default 1.0), matching the original DP; the 44-D EEF
+history is always passed to FiLM.  Inference returns the 8 actions for
+``n_action_steps`` (the ``start=n_obs_steps-1=0`` slice), so CamPose's evaluator
+executes exactly 8 actions and replans.
+
+Design note: keep the per-view latent spatial *before* fusion.  Global average
+pooling is translation-invariant and discards the object-localisation signal;
+the policy then collapses to a state-only controller on the *Rand tasks.
 
 Keep this file free of robosuite imports; the CPU tests instantiate it without
 a simulator.  ``diffusers`` is imported lazily inside ``BaselineDiffusionPolicy``
@@ -31,15 +36,19 @@ from baseline_common import (
     EEF_HIST_DIM,
     EEF_HIST_STEPS,
     FUSED_DIM,
-    IMAGENET_MEAN,
-    IMAGENET_STD,
     OBS_FEATURE_DIM,
+    PROPRIO_DIM,
+    SpatialSoftmax,
     replace_bn_with_gn,
 )
 
 
 class BaselineEncoder(nn.Module):
-    """B1 (variant A): no residual token mixer."""
+    """B1-style encoder: one latent per view, then a masked cross-view query.
+
+    Per-view latents keep their spatial layout via spatial-softmax keypoints;
+    global average pooling is deliberately not used (see the module docstring).
+    """
 
     def __init__(
         self,
@@ -49,7 +58,6 @@ class BaselineEncoder(nn.Module):
         n_heads: int = 8,
         cond_dim: int = 128,
         use_group_norm: bool = True,
-        norm_rgb_imagenet: bool = True,
     ) -> None:
         super().__init__()
         if in_channels != 9:
@@ -59,7 +67,6 @@ class BaselineEncoder(nn.Module):
         self.in_channels = in_channels
         self.eef_hist_dim = EEF_HIST_DIM
         self.fused_dim = fused_dim
-        self.norm_rgb_imagenet = bool(norm_rgb_imagenet)
         if eef_hist_steps * 11 != self.eef_hist_dim:
             raise ValueError(
                 f"eef_hist_steps={eef_hist_steps} gives {eef_hist_steps * 11} dims, "
@@ -68,7 +75,7 @@ class BaselineEncoder(nn.Module):
 
         resnet = torchvision.models.resnet18(weights=None)
 
-        # Exact B1 initialisation: widen conv1 to 9 channels, copy RGB weights
+        # B1-style initialisation: widen conv1 to 9 channels, copy RGB weights
         # into channels 0:3, zero the 6 new Plucker channels, copy the bias.
         old_conv = resnet.conv1
         new_conv = nn.Conv2d(
@@ -96,7 +103,10 @@ class BaselineEncoder(nn.Module):
         self.layer2 = resnet.layer2
         self.layer3 = resnet.layer3
         self.layer4 = resnet.layer4
-        self.avgpool = resnet.avgpool
+        # Keep layer4's spatial grid: global average pooling destroys the
+        # localisation signal needed to act on the scene.
+        self.spatial_pool = SpatialSoftmax((fused_dim, 8, 8), num_kp=32)
+        self.spatial_proj = nn.Linear(2 * 32, fused_dim)
 
         # FiLM at stem, layer1, layer2, layer3, layer4.
         self.film_widths = (64, 64, 128, 256, 512)
@@ -116,14 +126,6 @@ class BaselineEncoder(nn.Module):
             embed_dim=fused_dim, num_heads=n_heads, batch_first=True
         )
         self.fusion_query = nn.Parameter(torch.zeros(1, 1, fused_dim))
-
-        if self.norm_rgb_imagenet:
-            self.register_buffer(
-                "rgb_mean", torch.tensor(IMAGENET_MEAN).view(1, 1, 3, 1, 1)
-            )
-            self.register_buffer(
-                "rgb_std", torch.tensor(IMAGENET_STD).view(1, 1, 3, 1, 1)
-            )
 
     @staticmethod
     def _film(h, film_layer, cond):
@@ -153,21 +155,17 @@ class BaselineEncoder(nn.Module):
             raise ValueError(
                 f"expected {self.in_channels} channels, got {image.shape[2]}"
             )
-        rgb = image[:, :, :3]
-        plucker = image[:, :, 3:]
-        if self.norm_rgb_imagenet:
-            mean = self.rgb_mean.to(device=image.device, dtype=image.dtype)
-            std = self.rgb_std.to(device=image.device, dtype=image.dtype)
-            rgb = (rgb * 2.0 - 1.0 - mean) / std
-        return torch.cat([rgb, plucker], dim=2)
+        # RGB is rgb/255 and Plucker is raw: the original DP applies no
+        # ImageNet normalisation, so the validated input is used unchanged.
+        return image
 
-    def forward_full(self, image, eef_state, eef_hist, view_mask):
+    def forward_full(self, image, proprio, eef_hist, view_mask):
         """Return ``z_global`` and per-view diagnostics.
 
         Args:
-            image: (N, K, 9, H, W)
-            eef_state: (N, 9), already normalised
-            eef_hist: (N, K, 44), raw camera-frame history
+            image: (N, K, 9, H, W), rgb/255 + raw Plucker
+            proprio: (N, 7), normalised joint qpos (constant when dropped)
+            eef_hist: (N, K, 44), z-scored camera-frame history
             view_mask: (N, K) bool/float; inactive views are ignored
         """
         n, k = image.shape[0], image.shape[1]
@@ -176,9 +174,10 @@ class BaselineEncoder(nn.Module):
                 f"eef_hist shape {tuple(eef_hist.shape)} does not match image "
                 f"{(n, k, '...')}"
             )
-        if eef_state.shape != (n, 9):
+        if proprio.shape != (n, PROPRIO_DIM):
             raise ValueError(
-                f"eef_state must be (N, 9)=( {n}, 9), got {tuple(eef_state.shape)}"
+                f"proprio must be (N, {PROPRIO_DIM})=({n}, {PROPRIO_DIM}), "
+                f"got {tuple(proprio.shape)}"
             )
 
         active = view_mask > 0.5
@@ -200,7 +199,7 @@ class BaselineEncoder(nn.Module):
                 f"expected an 8x8 layer4 grid at 256x256, got "
                 f"{tuple(fmap.shape[-2:])}"
             )
-        z_base = self.avgpool(fmap).flatten(1)
+        z_base = self.spatial_proj(self.spatial_pool(fmap).flatten(1))
 
         tokens = z_base.new_zeros((n, k, self.fused_dim))
         tokens[rows, cols] = z_base
@@ -209,7 +208,7 @@ class BaselineEncoder(nn.Module):
             query, tokens, tokens, key_padding_mask=~active, need_weights=False
         )[0][:, 0]
 
-        out = torch.cat([z_global, eef_state], dim=-1)
+        out = torch.cat([z_global, proprio], dim=-1)
         return {
             "z_global": z_global,
             "z_views": tokens,
@@ -217,18 +216,18 @@ class BaselineEncoder(nn.Module):
             "out": out,
         }
 
-    def forward(self, image, eef_state, eef_hist, view_mask):
-        return self.forward_full(image, eef_state, eef_hist, view_mask)["out"]
+    def forward(self, image, proprio, eef_hist, view_mask):
+        return self.forward_full(image, proprio, eef_hist, view_mask)["out"]
 
 
 class BaselineDiffusionPolicy(nn.Module):
-    """DP head conditioned on B1's 521-D per-frame observation feature."""
+    """DP head conditioned on B1's 519-D per-frame observation feature."""
 
     def __init__(
         self,
         args,
         horizon: int = 16,
-        n_obs_steps: int = 2,
+        n_obs_steps: int = 1,
         n_action_steps: int = 8,
         num_inference_steps: int = 100,
         down_dims=(512, 1024, 2048),
@@ -294,21 +293,21 @@ class BaselineDiffusionPolicy(nn.Module):
             raise ValueError(
                 f"expected {self.n_obs_steps} observation frames, got {to}"
             )
-        eef_state = data_dict["eef_state"]
+        proprio = data_dict["proprio"]
         eef_hist = data_dict["eef_hist"]
         view_mask = data_dict["view_mask"]
-        if eef_state.shape[:2] != (b, to):
+        if proprio.shape[:2] != (b, to):
             raise ValueError(
-                f"eef_state must be (B, To, 9)=({b}, {to}, 9), "
-                f"got {tuple(eef_state.shape)}"
+                f"proprio must be (B, To, 7)=({b}, {to}, 7), "
+                f"got {tuple(proprio.shape)}"
             )
 
         image = image.reshape(b * to, k, *image.shape[3:])
-        eef_state = eef_state.reshape(b * to, 9)
+        proprio = proprio.reshape(b * to, PROPRIO_DIM)
         eef_hist = eef_hist.reshape(b * to, k, -1)
         view_mask = view_mask.reshape(b * to, k)
 
-        z = self.encoder(image, eef_state, eef_hist, view_mask)
+        z = self.encoder(image, proprio, eef_hist, view_mask)
         if z.shape != (b * to, self.obs_feature_dim):
             raise ValueError(
                 f"encoder returned {tuple(z.shape)}, expected "

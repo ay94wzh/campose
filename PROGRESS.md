@@ -2,9 +2,8 @@
 
 Session log for executing `BASELINE_REMOTE_TRAINING.md` on this machine.
 Branch `method/baseline`, HEAD `7af6bfa0b18d932366ad775ef6b756d9c7e807aa`.
-No commits were made; all code changes are in the working tree.
 
-## 1. Machine and environment
+<!-- ## 1. Machine and environment
 
 - GPU: 2× NVIDIA GeForce RTX 5090, 32.6 GB each.
   - GPU 0 was occupied by another user's job (~22.6 GB); it was not used.
@@ -13,9 +12,9 @@ No commits were made; all code changes are in the working tree.
   - torch `2.11.0+cu128`, torchvision `0.26.0+cu128`, CUDA available (12.8)
   - diffusers `0.40.0`, transformers `5.16.1`, mujoco `3.1.6`, h5py `3.16.0`
   - robosuite `1.5.1`, wandb `0.29.0`, gdown `6.1.0`
-- EGL works: `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl` (no display; osmesa not needed).
+- EGL works: `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl` (no display; osmesa not needed). -->
 
-### Environment repairs
+<!-- ### Environment repairs
 
 - The env's editable installs for `robosuite` and `mani_skill` pointed at
   `/home/zihan/repos/CamPoseOpensource`, which does not exist on this machine
@@ -30,17 +29,17 @@ No commits were made; all code changes are in the working tree.
   - All have `action_space: eef_delta` and obs keys including
     `robot0_eef_pos`, `robot0_eef_quat`, `robot0_gripper_qpos`.
   - Note: installed gdown 6.1.0 rejects `setup.sh`'s `--remaining-ok` flag, so
-    the files were fetched by Drive file ID instead.
+    the files were fetched by Drive file ID instead. -->
 
-## 2. Preflight
+<!-- ## 2. Preflight
 
 | Check | Result |
 |---|---|
 | `python tests/test_baseline_encoder.py` | `all baseline tests passed` |
 | `python policy_robosuite/train.py --help` | OK |
-| EGL offscreen render (LiftRand, 256²) | OK |
+| EGL offscreen render (LiftRand, 256²) | OK | -->
 
-## 3. Smoke tests
+<!-- ## 3. Smoke tests
 
 ### Required smoke (prescribed command)
 
@@ -52,22 +51,22 @@ Lift, K=1, batch 4, 2 epochs, 1 eval episode × 30 steps:
   `config.json`, `dataset_stats.json`, `epoch_0.pth`, `epoch_1.pth`,
   `eval_epoch_{0,1}_agentview/success_by_seed.json`, MP4s.
 - `dataset_stats.json` has `action_mean/std` (7), `eef_mean/std` (9),
-  `state_mean/std` (7).
+  `state_mean/std` (7). -->
 
-### Additional K=2 smoke tests (not prescribed, done to cover 2-camera config)
+<!-- ### Additional K=2 smoke tests (not prescribed, done to cover 2-camera config)
 
 - Can, 1 epoch: `train_loss 1.03667`, `val_loss 1.12185`.
 - Square, 1 epoch: `train_loss 1.03321`, `val_loss 1.15408`.
-- Checkpoints under `/data/zihan/campose_checkpoints/smoke_{can,square}_2cam`.
+- Checkpoints under `/data/zihan/campose_checkpoints/smoke_{can,square}_2cam`. -->
 
-### Resume test
+<!-- ### Resume test
 
 Re-launched the can smoke with the same `--name`; it loaded the latest
-checkpoint, resumed at the right epoch, and reused the same offline W&B run ID.
+checkpoint, resumed at the right epoch, and reused the same offline W&B run ID. -->
 
-## 4. Uncommitted code changes
+## 1. Code changes
 
-### 4.1 Gripper joint index dict (`baseline_common.py`)
+### Gripper joint index dict (`baseline_common.py`)
 
 This robosuite fork stores `robot._ref_gripper_joint_pos_indexes` as
 `{'right': [7, 8]}` rather than a list. `find_gripper_qpos_indices()` now
@@ -75,7 +74,7 @@ accepts both forms and returns a flat `int64` array. Without this, the smoke
 test crashed in `BaselineEvaluator.__init__` with
 `TypeError: int() argument ... not 'dict'`.
 
-### 4.2 EEF quaternion: body vs site (`baseline_common.py`, `baseline_eval.py`, `baseline_data.py`)
+### EEF quaternion: body vs site (`baseline_common.py`, `baseline_eval.py`, `baseline_data.py`)
 
 The demo HDF5 `robot0_eef_quat` is sourced from the EEF **body**
 (`sim.data.get_body_xquat('robot0_right_hand')`), not from the gripper **site**
@@ -99,7 +98,7 @@ Verified at the same demo state: body quaternion matches the stored
 `robot0_eef_quat` (after xyzw→wxyz conversion). Position and gripper values
 already matched the site observations.
 
-## 5. Full run
+## 2. Full run
 
 ### Configuration
 
@@ -124,12 +123,12 @@ Operational deviations:
 
 - `--ckpt_dir /data/zihan/campose_checkpoints/<name>` — the root filesystem is
   97% full (62 GB free); each run keeps ~3 checkpoints of ~3.5 GB plus videos.
-- `--save_every 50` — the runbook's 7.5 h resume check lives inside the
+<!-- - `--save_every 50` — the runbook's 7.5 h resume check lives inside the
   checkpoint block; the default `save_every=1000` would checkpoint only at
   epoch 0 and 1000.
-- W&B offline (`WANDB_MODE=offline`); runs support `wandb sync` later.
+- W&B offline (`WANDB_MODE=offline`); runs support `wandb sync` later. -->
 
-### Result: `baseline_lift_rand_seed_0`
+### 3. Result: `baseline_lift_rand_seed_0`
 
 - Started 2026-11-05 00:43:32, finished 2026-11-05 05:46:06 (5h02m).
 - Completed epoch 1000 (1001 epochs).
@@ -139,17 +138,16 @@ Operational deviations:
   - epochs 650–1000: 50 episodes each (8 evals), all 0.
 - Offline W&B: `wandb/offline-run-20261105_004334-bueba3uf`.
 - Checkpoints: `/data/zihan/campose_checkpoints/baseline_lift_rand_seed_0`
-  (9.8 GB, keeps the last 3 checkpoints plus eval videos/JSONs).
 
-### `baseline_can_rand_seed_0` (stopped)
+<!-- ### `baseline_can_rand_seed_0` (stopped)
 
 Started 05:46; was still in its epoch-0 evaluation when the queue was stopped.
 Episodes 0–8 all `Success = False`; no training epochs had run.
 
 The remaining seven runs were **not started**. The tmux session was killed and
-GPU 1 freed (58 MiB remaining).
+GPU 1 freed (58 MiB remaining). -->
 
-## 6. Diagnosis of the zero-success result
+## 4. Diagnosis of the zero-success result
 
 The zero is not an evaluation-harness artefact. Verified:
 
@@ -166,7 +164,7 @@ The zero is not an evaluation-harness artefact. Verified:
 - **Eval EEF fix:** re-evaluating the epoch-1000 lift checkpoint with the fixed
   body-quaternion evaluator still gives **0/10** success.
 
-### Root cause: policy collapsed to a 9-D state-only controller
+### 5. Root cause: policy collapsed to a 9-D state-only controller
 
 Sensitivity of sampled actions on the final checkpoint:
 
@@ -199,7 +197,7 @@ A state-only controller cannot solve LiftRand, which explains the 0 success.
 The collapse is a training/optimization issue in the baseline implementation,
 not in the run harness, data loading, reward check, or camera convention.
 
-## 7. Current state / artefacts
+<!-- ## 7. Current state / artefacts
 
 - Working tree (`git status --short`):
   - `M BASELINE_REMOTE_TRAINING.md` (pre-existing)
@@ -215,18 +213,18 @@ not in the run harness, data loading, reward check, or camera convention.
   - `policy_robosuite/checkpoints/baseline_smoke_seed_0` (4.4 GB, root disk)
   - logs: `/data/zihan/campose_logs/<name>.log`, `queue.log`
   - queue script: `/data/zihan/campose_logs/run_baseline_queue.sh`
-- tmux `campose_baseline` is stopped; no `train.py` processes remain.
+- tmux `campose_baseline` is stopped; no `train.py` processes remain. -->
 
-### Environment warnings (non-blocking)
+<!-- ### Environment warnings (non-blocking)
 
 - mujoco `3.1.6` is below robosuite's declared `>=3.3.0` and mink's `>=3.10`,
   but imports and all smokes/full run worked.
 - `robosuite_models` and mink-based whole-body IK are missing; irrelevant for
   the Panda tasks.
 - `⚠️ Render fault detected; rebuilding context` appears after evaluations; the
-  existing `env.reset()` fallback handles it without failing the run.
+  existing `env.reset()` fallback handles it without failing the run. -->
 
-## 8. Suggested next steps
+<!-- ## 8. Suggested next steps
 
 1. Investigate the image-conditioning collapse before running more seeds:
    encoder gradients/feature variance during training, whether the UNet's
@@ -239,4 +237,4 @@ not in the run harness, data loading, reward check, or camera convention.
    - restart the queue with
      `tmux new-session -d -s campose_baseline "bash /data/zihan/campose_logs/run_baseline_queue.sh"`;
    - existing runs resume from their latest checkpoint by `--name`;
-   - sync offline W&B with `wandb sync <offline-run-dir>`.
+   - sync offline W&B with `wandb sync <offline-run-dir>`. -->
