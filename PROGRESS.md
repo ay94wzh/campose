@@ -4,8 +4,7 @@ Session log for executing `BASELINE_REMOTE_TRAINING.md` (v1) and
 `REMOTE_LIFT_TRAINING.md` (v2) on this machine.
 Branch `method/baseline`; v1 runs at HEAD
 `7af6bfa0b18d932366ad775ef6b756d9c7e807aa`, v2 run at HEAD
-`a0b3e3d1694e1b60596b81ada259a5ff51f5b478`.
-
+`a0b3e3d1694e1b60596b81ada259a5ff51f5b478`
 **Latest result (v2, §6):** Lift seed 0 reached **146/530 = 27.5%** success
 (best 25/50 = 0.50 at epoch 9500; final 18/50 = 0.36).
 
@@ -309,6 +308,86 @@ Same seeded diffusion noise, batch of 4, image input zeroed:
 
 The v2 checkpoint is ~200× more sensitive to the image than the v1 checkpoint
 (reference action std 0.3745), so the encoder is using vision.
+
+### Vision sensitivity at 1000 epochs
+
+The original v2 run kept only the last 3 checkpoints, so its epoch-1000 weights
+were gone. A same-config/seed rerun (`--name
+baseline_lift_rand_v2_repro1000_seed_0`, same LR schedule via `--num_epochs
+10001`) was stopped immediately after `epoch_1000.pth` was written
+(`/data/zihan/campose_checkpoints/baseline_lift_rand_v2_epoch1000_seed_0/`).
+Its epoch-1000 evaluation reproduced the original result (0/10; identical
+`success_by_seed.json`); video bytes differ, so the rerun is not bit-identical.
+
+Real validation-demo protocol (the same two demos and transform as the v1
+check in §5):
+
+| Checkpoint | Zero image | Zero 44-D EEF history | Zero state slot |
+|---|---:|---:|---:|
+| v1, epoch 1000 | 0.0005 | 0.0067 | 0.349 (9-D EEF state) |
+| v2, epoch 1000 (repro) | **0.0577** | 0.0275 | 0.0168 (7-D proprio) |
+| v2, epoch 10000 | **0.1167** | 0.0482 | 0.0327 (7-D proprio) |
+
+The v2 "state slot" is the constant `-state_mean/state_std` for every sample,
+because `prob_drop_proprio=1.0` zeroes the raw qpos **before** normalisation.
+Zeroing that slot sets the constant to 0; it is an out-of-distribution control,
+not evidence that v2 uses state — varying the raw qpos has exactly zero effect
+by construction. The v1 9-D EEF state, by contrast, is a real per-sample input.
+
+Synthetic protocol (the same batch/noise as the final-checkpoint check above):
+
+| Checkpoint | Mean abs change | Max abs change |
+|---|---:|---:|
+| v2, epoch 1000 | 0.0626 | 1.97 |
+| v2, epoch 10000 | 0.1079 | 2.00 |
+
+At 1000 epochs v2 is already ~115× more image-sensitive than v1, and its image
+sensitivity roughly doubles by epoch 10000. The v2 encoder uses vision well
+before the final checkpoint.
+
+### v1 no-state ablation (1000 epochs)
+
+v1 concatenates a real per-sample 9-D EEF state directly into the 521-D
+condition; §5 showed this dominates (zeroing it changes actions by 0.349, the
+image by 0.0005). To test whether that shortcut caused the collapse, v1 was
+retrained from the fixed v1 snapshot (`92b9c10`) with the raw 9-D EEF state
+zeroed **before** normalisation in both the dataset and the evaluator — the v1
+analog of `prob_drop_proprio=1.0`. The 521-D architecture is unchanged; the 9
+state dims are the constant `-eef_mean/eef_std` (per-sample std exactly 0).
+
+Setup: `v1_nostate_lift_rand_seed_0`, 1001 epochs, batch 32, seed 0, lr 1e-4,
+wd 1e-6, evals at epochs 0/500/1000 with 10 episodes (the v1 baseline evaluated
+every 50 epochs, so this sparse-eval run is not RNG-identical). Stopped after
+the epoch-1000 save; checkpoint at
+`/data/zihan/campose_checkpoints/v1_nostate_epoch1000_seed_0/`.
+
+Success:
+
+| Epoch | Episodes | Successes |
+|---:|---:|---:|
+| 0 | 10 | 0 |
+| 500 | 10 | 1 |
+| 1000 | 10 | 4 |
+
+(v1 baseline: 0/530 at every evaluation.)
+
+Sensitivity at epoch 1000, same real-demo protocol:
+
+| Checkpoint | Zero image | Zero 44-D history | Zero state slot |
+|---|---:|---:|---:|
+| v1 baseline, epoch 1000 | 0.0005 | 0.0067 | 0.349 |
+| v1 no-state, epoch 1000 | **0.0035** | **0.1673** | 0.0160 |
+| v2, epoch 1000 | 0.0577 | 0.0275 | 0.0168 |
+| v2, epoch 10000 | 0.1167 | 0.0482 | 0.0327 |
+
+Removing the 9-D state raises image sensitivity only ~7× (0.0005 → 0.0035) and
+leaves it ~17× below v2 at the same epoch; the model's dominant dependence
+moves to the 44-D EEF history (~25×, 0.0067 → 0.1673). The no-state v1 reaches
+4/10 at epoch 1000, but the sensitivity profile points to the proprioceptive
+history path rather than vision; an image-ablation evaluation would be needed
+to confirm that. Removing the direct state shortcut alone is not enough — v2's
+spatial-softmax keypoints instead of global avgpool are what make the image the
+dominant input.
 
 ### Evaluation videos
 
