@@ -16,7 +16,7 @@ from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
-from baseline_common import BASELINE_ARCH
+from baseline_common import baseline_arch_name
 from baseline_data import load_baseline_data
 from baseline_eval import BaselineEvaluator
 from models.baseline import BaselineDiffusionPolicy
@@ -142,7 +142,15 @@ def main(args, ckpt=None):
         if epoch % args.eval_every == 0:
             policy.eval()
             if args.policy_class == 'baseline':
-                eval_pose_names = ['agentview']
+                # Origin protocol: one camera pose per episode from each pose
+                # file (train_cameras, test_cameras).  Agentview is an explicit
+                # fallback for the old protocol.
+                if args.baseline_eval_agentview or args.default_cam:
+                    eval_pose_names = ['agentview']
+                else:
+                    eval_pose_names = [
+                        os.path.splitext(pose_file)[0] for pose_file in args.pose_files
+                    ]
             else:
                 eval_pose_names = [pose_file[:-5] for pose_file in args.pose_files]
             for pose_name in eval_pose_names:
@@ -185,7 +193,7 @@ def main(args, ckpt=None):
                 'loss': summary['loss'] if summary is not None else None,
                 'wandb_id': wandb.run.id,
                 'eef_hist_norm': True,
-                'baseline_arch': BASELINE_ARCH,
+                'baseline_arch': baseline_arch_name(args.baseline_pool),
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
@@ -241,6 +249,11 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
     parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','baseline'], help='policy class')
+    parser.add_argument('--baseline_pool', type=str, default='spatial_softmax',
+                        choices=['spatial_softmax', 'avgpool'],
+                        help='baseline encoder per-view pooling; avgpool is the v1-parity ablation')
+    parser.add_argument('--baseline_eval_agentview', type=str2bool, default=False,
+                        help='baseline only: evaluate on the fixed agentview instead of the pose files')
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
@@ -338,11 +351,12 @@ if __name__ == '__main__':
                 "resuming would silently change the FiLM input scale. "
                 "Retrain with a fresh --name."
             )
-        if args.policy_class == 'baseline' and ckpt.get('baseline_arch') != BASELINE_ARCH:
+        selected_arch = baseline_arch_name(args.baseline_pool)
+        if args.policy_class == 'baseline' and ckpt.get('baseline_arch') != selected_arch:
             raise RuntimeError(
                 "This baseline checkpoint was trained with a different encoder "
                 "architecture (checkpoint 'baseline_arch' != "
-                f"{BASELINE_ARCH!r}); its state_dict is incompatible. Retrain "
+                f"{selected_arch!r}); its state_dict is incompatible. Retrain "
                 "with a fresh --name."
             )
         wandb_id = ckpt['wandb_id']

@@ -10,6 +10,7 @@ shape test is skipped if diffusers is unavailable.
 """
 import os
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -21,12 +22,15 @@ if POLICY_ROOT not in sys.path:
     sys.path.insert(0, POLICY_ROOT)
 
 from baseline_common import (  # noqa: E402
+    BASELINE_ARCH,
+    BASELINE_ARCH_AVGPOOL,
     EEF_HIST_STEPS,
     OBS_FEATURE_DIM,
     PROPRIO_DIM,
     SpatialSoftmax,
     action_window_indices,
     apply_shared_crop,
+    baseline_arch_name,
     cam_c2w_to_pos_quat,
     eef_hist_array,
     eef_hist_to_cam,
@@ -34,6 +38,7 @@ from baseline_common import (  # noqa: E402
     mat_to_rot6d,
     normalize_proprio,
     rot6d_to_mat,
+    select_eval_pose,
     shared_crop_params,
 )
 from models.baseline import BaselineDiffusionPolicy, BaselineEncoder  # noqa: E402
@@ -181,17 +186,83 @@ def test_proprio_drop_before_zscore():
 
 
 def test_encoder_shapes():
-    for k in (1, 2):
-        image, proprio, eef_hist, view_mask = _make_inputs(2, k)
-        model = BaselineEncoder().eval()
-        with torch.no_grad():
-            out = model(image, proprio, eef_hist, view_mask)
-            full = model.forward_full(image, proprio, eef_hist, view_mask)
-        assert out.shape == (2, OBS_FEATURE_DIM), out.shape
-        assert full["z_global"].shape == (2, 512)
-        assert full["z_views"].shape == (2, k, 512)
-        assert torch.isfinite(out).all()
-        print(f"ok encoder shapes k={k}")
+    for pool in ("spatial_softmax", "avgpool"):
+        for k in (1, 2):
+            image, proprio, eef_hist, view_mask = _make_inputs(2, k)
+            model = BaselineEncoder(pool=pool).eval()
+            with torch.no_grad():
+                out = model(image, proprio, eef_hist, view_mask)
+                full = model.forward_full(image, proprio, eef_hist, view_mask)
+            assert out.shape == (2, OBS_FEATURE_DIM), out.shape
+            assert full["z_global"].shape == (2, 512)
+            assert full["z_views"].shape == (2, k, 512)
+            assert torch.isfinite(out).all()
+            print(f"ok encoder shapes pool={pool} k={k}")
+
+
+def test_pooling_variants():
+    spatial = BaselineEncoder().eval()
+    assert hasattr(spatial, "spatial_pool")
+    assert hasattr(spatial, "spatial_proj")
+    assert not hasattr(spatial, "avgpool")
+
+    avg = BaselineEncoder(pool="avgpool").eval()
+    assert isinstance(avg.avgpool, torch.nn.AdaptiveAvgPool2d)
+    assert not hasattr(avg, "spatial_pool")
+    assert not hasattr(avg, "spatial_proj")
+
+    image, proprio, eef_hist, view_mask = _make_inputs(2, 1)
+    with torch.no_grad():
+        full = avg.forward_full(image, proprio, eef_hist, view_mask)
+    assert full["z_global"].shape == (2, 512)
+    assert full["out"].shape == (2, OBS_FEATURE_DIM)
+    assert torch.isfinite(full["out"]).all()
+
+    try:
+        BaselineEncoder(pool="bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid pooling accepted")
+    print("ok pooling variants")
+
+
+def test_arch_markers():
+    assert baseline_arch_name("spatial_softmax") == BASELINE_ARCH
+    assert baseline_arch_name("avgpool") == BASELINE_ARCH_AVGPOOL
+    try:
+        baseline_arch_name("bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid pooling marker accepted")
+    print("ok arch markers")
+
+
+def test_select_eval_pose():
+    agent = np.eye(4, dtype=np.float32)
+    p0 = np.eye(4, dtype=np.float32)
+    p1 = np.eye(4, dtype=np.float32)
+    p1[:3, 3] = [1.0, 2.0, 3.0]
+    poses = {"train_cameras": [p0, p1]}
+
+    assert np.allclose(select_eval_pose("train_cameras", 0, poses, agent), p0)
+    assert np.allclose(select_eval_pose("train_cameras", 1, poses, agent), p1)
+    assert np.allclose(select_eval_pose("agentview", 99, poses, agent), agent)
+
+    try:
+        select_eval_pose("test_cameras", 0, poses, agent)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("unknown pose set accepted")
+    try:
+        select_eval_pose("train_cameras", 2, poses, agent)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("out-of-range pose accepted")
+    print("ok eval pose selection")
 
 
 def test_no_imagenet_rgb_norm():
@@ -250,18 +321,6 @@ def test_policy_shapes():
         print("skip policy shapes: diffusers not installed")
         return
 
-    class Args:
-        action_dim = 7
-        lr = 1e-4
-        weight_decay = 1e-6
-
-    policy = BaselineDiffusionPolicy(
-        Args(),
-        down_dims=(32, 64),
-        diffusion_step_embed_dim=32,
-        num_inference_steps=2,
-    ).eval()
-
     image = torch.rand(1, 1, 1, 9, 256, 256)
     proprio = torch.randn(1, 1, PROPRIO_DIM)
     eef_hist = torch.randn(1, 1, 1, EEF_HIST_STEPS * 11)
@@ -269,29 +328,40 @@ def test_policy_shapes():
     actions = torch.randn(1, 16, 7)
     is_pad = torch.zeros(1, 16, dtype=torch.bool)
 
-    out = policy(
-        {
-            "image": image,
-            "proprio": proprio,
-            "eef_hist": eef_hist,
-            "view_mask": view_mask,
-            "actions": actions,
-            "is_pad": is_pad,
-        }
-    )
-    assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
+    for pool in ("spatial_softmax", "avgpool"):
+        args = SimpleNamespace(
+            action_dim=7, lr=1e-4, weight_decay=1e-6, baseline_pool=pool
+        )
+        policy = BaselineDiffusionPolicy(
+            args,
+            down_dims=(32, 64),
+            diffusion_step_embed_dim=32,
+            num_inference_steps=2,
+        ).eval()
 
-    with torch.no_grad():
-        act = policy(
+        out = policy(
             {
                 "image": image,
                 "proprio": proprio,
                 "eef_hist": eef_hist,
                 "view_mask": view_mask,
+                "actions": actions,
+                "is_pad": is_pad,
             }
         )
-    assert act.shape == (1, 8, 7), act.shape
-    print("ok policy train/inference shapes")
+        assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
+
+        with torch.no_grad():
+            act = policy(
+                {
+                    "image": image,
+                    "proprio": proprio,
+                    "eef_hist": eef_hist,
+                    "view_mask": view_mask,
+                }
+            )
+        assert act.shape == (1, 8, 7), act.shape
+        print(f"ok policy train/inference shapes pool={pool}")
 
 
 if __name__ == "__main__":
@@ -304,6 +374,9 @@ if __name__ == "__main__":
     test_spatial_softmax_operator()
     test_proprio_drop_before_zscore()
     test_encoder_shapes()
+    test_pooling_variants()
+    test_arch_markers()
+    test_select_eval_pose()
     test_no_imagenet_rgb_norm()
     test_film_identity_at_init()
     test_masked_view_equivalence()

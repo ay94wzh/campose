@@ -32,12 +32,18 @@ from baseline_common import (
     find_eef_site_id,
     find_gripper_qpos_indices,
     normalize_proprio,
+    select_eval_pose,
 )
 from eval import Evaluator, to_mp4
 
 
 class BaselineEvaluator(Evaluator):
-    """Fixed-agentview rollout with B1's observation/history buffers."""
+    """Pose-aware rollout with B1's observation/history buffers.
+
+    The camera pose is selected per episode from ``args.pose_files`` exactly as
+    in the origin ``Evaluator``; ``pose_name='agentview'`` uses the fixed default
+    camera.
+    """
 
     def __init__(self, env, norm_stats, dataset_path, args):
         super().__init__(
@@ -62,6 +68,11 @@ class BaselineEvaluator(Evaluator):
         )
         self.agentview_plucker = self._compute_plucker(self.agentview_c2w)
 
+        # Per-episode camera pose/Plücker; agentview until _evaluate_impl
+        # selects the pose for the requested pose_name/episode.
+        self.current_c2w = self.agentview_c2w
+        self.current_plucker = self.agentview_plucker
+
         self.state_mean = self.norm_stats["state_mean"].cpu().numpy()
         self.state_std = self.norm_stats["state_std"].cpu().numpy()
         self.eef_hist_mean = self.norm_stats["eef_hist_mean"].cpu().numpy()
@@ -83,10 +94,20 @@ class BaselineEvaluator(Evaluator):
             plucker = self.plucker_embedder(k_t, t_t)["plucker"][0]
         return plucker.permute(2, 0, 1).contiguous()
 
-    def _restore_agentview(self):
-        self.env.sim.model.cam_pos[self.agentview_cam_id] = self.agentview_cam_pos
-        self.env.sim.model.cam_quat[self.agentview_cam_id] = self.agentview_cam_quat
-        self.env.sim.forward()
+    def _select_eval_pose(self, pose_name, episode_num):
+        """Camera-to-world pose for this evaluation episode."""
+        if self.args.default_cam:
+            pose_name = "agentview"
+        return select_eval_pose(
+            pose_name,
+            episode_num,
+            getattr(self, "camera_poses_by_name", {}),
+            self.agentview_c2w,
+        )
+
+    def _set_eval_camera(self):
+        """Point the agentview camera at the episode's selected pose."""
+        self._set_camera_pose(self.current_c2w)
 
     # ------------------------------------------------------------- observations
     def _current_eef_raw(self):
@@ -110,9 +131,9 @@ class BaselineEvaluator(Evaluator):
         rgb_t = (
             torch.from_numpy(rgb).float().permute(2, 0, 1).to(self.device) / 255.0
         )
-        image = torch.cat([rgb_t, self.agentview_plucker], dim=0)  # (9, H, W)
+        image = torch.cat([rgb_t, self.current_plucker], dim=0)  # (9, H, W)
 
-        cam_pos, cam_quat_wxyz = cam_c2w_to_pos_quat(self.agentview_c2w)
+        cam_pos, cam_quat_wxyz = cam_c2w_to_pos_quat(self.current_c2w)
         hist = self._eef_history(eef_deque, cam_pos, cam_quat_wxyz)
         hist = (hist - self.eef_hist_mean) / self.eef_hist_std
 
@@ -160,13 +181,15 @@ class BaselineEvaluator(Evaluator):
         init_state=None,
         episode_num=0,
     ):
-        self._restore_agentview()
         if init_state is not None:
             self.env.reset()
             self.env.sim.set_state_from_flattened(init_state)
         else:
             self.env.reset()
-        self._restore_agentview()
+
+        self.current_c2w = self._select_eval_pose(pose_name, episode_num)
+        self.current_plucker = self._compute_plucker(self.current_c2w)
+        self._set_eval_camera()
 
         if self.action_space in ("eef_delta", "joint_delta"):
             self.env.set_init_action()

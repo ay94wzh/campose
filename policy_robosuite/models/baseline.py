@@ -1,7 +1,10 @@
-"""B1-style encoder (spatial-softmax pooling) + diffusion-policy head.
+"""B1-style encoder (spatial-softmax pooling by default) + diffusion-policy head.
 
 This is the `baseline` method: B1's view-conditioned encoder (no residual token
 branch) with the original DP's input conventions, attached to the DP UNet.
+``BaselineEncoder(pool="avgpool")`` is the v1-parity ablation: everything else is
+identical, but each view is reduced by global average pooling instead of
+spatial-softmax keypoints.
 
     image (N, K, 9, 256, 256)   # rgb/255 + raw Plucker, no ImageNet norm
       -> shared ResNet18 (no pretrained weights, GroupNorm)
@@ -46,8 +49,9 @@ from baseline_common import (
 class BaselineEncoder(nn.Module):
     """B1-style encoder: one latent per view, then a masked cross-view query.
 
-    Per-view latents keep their spatial layout via spatial-softmax keypoints;
-    global average pooling is deliberately not used (see the module docstring).
+    Per-view latents keep their spatial layout via spatial-softmax keypoints by
+    default.  ``pool="avgpool"`` is the v1-parity ablation and deliberately
+    discards that layout.
     """
 
     def __init__(
@@ -58,15 +62,22 @@ class BaselineEncoder(nn.Module):
         n_heads: int = 8,
         cond_dim: int = 128,
         use_group_norm: bool = True,
+        pool: str = "spatial_softmax",
     ) -> None:
         super().__init__()
         if in_channels != 9:
             raise ValueError(
                 f"baseline expects 9 channels (RGB 3 + Plucker 6), got {in_channels}"
             )
+        if pool not in ("spatial_softmax", "avgpool"):
+            raise ValueError(
+                "pool must be 'spatial_softmax' or 'avgpool', "
+                f"got {pool!r}"
+            )
         self.in_channels = in_channels
         self.eef_hist_dim = EEF_HIST_DIM
         self.fused_dim = fused_dim
+        self.pool = pool
         if eef_hist_steps * 11 != self.eef_hist_dim:
             raise ValueError(
                 f"eef_hist_steps={eef_hist_steps} gives {eef_hist_steps * 11} dims, "
@@ -103,10 +114,14 @@ class BaselineEncoder(nn.Module):
         self.layer2 = resnet.layer2
         self.layer3 = resnet.layer3
         self.layer4 = resnet.layer4
-        # Keep layer4's spatial grid: global average pooling destroys the
-        # localisation signal needed to act on the scene.
-        self.spatial_pool = SpatialSoftmax((fused_dim, 8, 8), num_kp=32)
-        self.spatial_proj = nn.Linear(2 * 32, fused_dim)
+        if self.pool == "spatial_softmax":
+            # Keep layer4's spatial grid: global average pooling destroys the
+            # localisation signal needed to act on the scene.
+            self.spatial_pool = SpatialSoftmax((fused_dim, 8, 8), num_kp=32)
+            self.spatial_proj = nn.Linear(2 * 32, fused_dim)
+        else:
+            # v1-parity ablation: one global feature vector per view.
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # FiLM at stem, layer1, layer2, layer3, layer4.
         self.film_widths = (64, 64, 128, 256, 512)
@@ -199,7 +214,10 @@ class BaselineEncoder(nn.Module):
                 f"expected an 8x8 layer4 grid at 256x256, got "
                 f"{tuple(fmap.shape[-2:])}"
             )
-        z_base = self.spatial_proj(self.spatial_pool(fmap).flatten(1))
+        if self.pool == "spatial_softmax":
+            z_base = self.spatial_proj(self.spatial_pool(fmap).flatten(1))
+        else:
+            z_base = self.avgpool(fmap).flatten(1)
 
         tokens = z_base.new_zeros((n, k, self.fused_dim))
         tokens[rows, cols] = z_base
@@ -249,7 +267,8 @@ class BaselineDiffusionPolicy(nn.Module):
         self.lr = float(getattr(args, "lr", 1e-4))
         self.weight_decay = float(getattr(args, "weight_decay", 1e-6))
 
-        self.encoder = BaselineEncoder()
+        self.baseline_pool = getattr(args, "baseline_pool", "spatial_softmax")
+        self.encoder = BaselineEncoder(pool=self.baseline_pool)
         self.unet = ConditionalUnet1D(
             input_dim=self.action_dim,
             local_cond_dim=None,

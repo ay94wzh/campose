@@ -1,7 +1,8 @@
 """Simulator-free helpers for the `baseline` method.
 
-The `baseline` policy is a B1-style encoder (spatial-softmax pooling, no
-residual token branch) attached to a diffusion-policy UNet.  This module holds
+The `baseline` policy is a B1-style encoder (spatial-softmax pooling by default;
+``pool="avgpool"`` is the v1-parity ablation, no residual token branch) attached
+to a diffusion-policy UNet.  This module holds
 only the geometry, indexing, cropping and normalisation helpers shared by the
 dataset, the evaluator and the CPU tests.  Nothing here imports robosuite or
 mani_skill.
@@ -52,6 +53,47 @@ CROP_MAX_SIDE = IMAGE_SIZE
 # Bump whenever the encoder or input normalisation changes; stored in every
 # baseline checkpoint so stale weights cannot be resumed silently.
 BASELINE_ARCH = "spatial_softmax_nobs1_proprio7_v1"
+BASELINE_ARCH_AVGPOOL = "avgpool_nobs1_proprio7_v1"
+
+
+def baseline_arch_name(pool: str = "spatial_softmax") -> str:
+    """Checkpoint architecture marker for the selected per-view pooling."""
+    if pool == "spatial_softmax":
+        return BASELINE_ARCH
+    if pool == "avgpool":
+        return BASELINE_ARCH_AVGPOOL
+    raise ValueError(
+        f"unknown baseline pooling {pool!r}; expected 'spatial_softmax' or 'avgpool'"
+    )
+
+
+def select_eval_pose(
+    pose_name: str,
+    episode_num: int,
+    poses_by_name: dict,
+    agentview_c2w,
+):
+    """Select the camera-to-world pose for one evaluation episode.
+
+    Mirrors the origin ``Evaluator`` with ``num_side_cam=1``:
+    ``poses[episode_num]``.  ``pose_name='agentview'`` returns the fixed
+    default camera pose.
+    """
+    if pose_name == "agentview":
+        return np.asarray(agentview_c2w, dtype=np.float32)
+    if pose_name not in poses_by_name:
+        raise KeyError(
+            f"unknown eval pose set {pose_name!r}; available: "
+            f"{sorted(poses_by_name)}"
+        )
+    poses = poses_by_name[pose_name]
+    idx = int(episode_num)
+    if idx >= len(poses):
+        raise IndexError(
+            f"pose index {idx} out of range for {pose_name!r} "
+            f"({len(poses)} poses)"
+        )
+    return np.asarray(poses[idx], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
