@@ -1,7 +1,13 @@
-# Baseline run progress — 2026-11-05 / 2026-11-06
+# Baseline run progress — 2026-11-05 / 2026-11-07
 
-Session log for executing `BASELINE_REMOTE_TRAINING.md` on this machine.
-Branch `method/baseline`, HEAD `7af6bfa0b18d932366ad775ef6b756d9c7e807aa`.
+Session log for executing `BASELINE_REMOTE_TRAINING.md` (v1) and
+`REMOTE_LIFT_TRAINING.md` (v2) on this machine.
+Branch `method/baseline`; v1 runs at HEAD
+`7af6bfa0b18d932366ad775ef6b756d9c7e807aa`, v2 run at HEAD
+`a0b3e3d1694e1b60596b81ada259a5ff51f5b478`.
+
+**Latest result (v2, §6):** Lift seed 0 reached **146/530 = 27.5%** success
+(best 25/50 = 0.50 at epoch 9500; final 18/50 = 0.36).
 
 <!-- ## 1. Machine and environment
 
@@ -128,7 +134,7 @@ Operational deviations:
   epoch 0 and 1000.
 - W&B offline (`WANDB_MODE=offline`); runs support `wandb sync` later. -->
 
-### 3. Result: `baseline_lift_rand_seed_0`
+### 3. Result: `baseline_lift_rand_seed_0` (v1 — superseded by §6)
 
 - Started 2026-11-05 00:43:32, finished 2026-11-05 05:46:06 (5h02m).
 - Completed epoch 1000 (1001 epochs).
@@ -196,6 +202,119 @@ A state-only controller cannot solve LiftRand, which explains the 0 success.
 
 The collapse is a training/optimization issue in the baseline implementation,
 not in the run harness, data loading, reward check, or camera convention.
+
+## 6. v2 baseline run and results (2026-11-06/07)
+
+The v2 baseline (`BASELINE_ARCH = "spatial_softmax_nobs1_proprio7_v1"`,
+`OBS_FEATURE_DIM = 519`) replaces the v1 input conventions with the original
+DP's and keeps spatial information in the encoder:
+
+- DP `n_obs_steps=1`: one observation frame at `t`, action window `[t, t+16)`,
+  8 executed actions;
+- 7-D joint-qpos proprio zeroed before the DP min-max normalisation
+  (`--prob_drop_proprio 1.0`, the default);
+- no ImageNet RGB normalisation (`rgb/255` + raw Plücker);
+- per-view spatial-softmax keypoints instead of global average pooling;
+- 44-D camera-frame EEF history still feeds FiLM (past-only, z-scored).
+
+### Run setup
+
+| Setting | Value |
+|---|---|
+| Git | branch `method/baseline`, HEAD `a0b3e3d1694e1b60596b81ada259a5ff51f5b478`, clean |
+| Env | `know_your_camera`; torch `2.11.0+cu128`, torchvision `0.26.0+cu128`; EGL |
+| GPU | 2× RTX 5090, 32 607 MiB each; run pinned to GPU 1 (`CUDA_VISIBLE_DEVICES=1`) |
+| Data | `liftrand_eef_delta.hdf5`, 300 demos (200 train + 10 validation) |
+| tmux / log | `campose_lift_v2`; `/data/zihan/campose_logs/baseline_lift_rand_v2_seed_0.log` |
+| Checkpoints | `/data/zihan/campose_checkpoints/baseline_lift_rand_v2_seed_0` |
+| W&B offline | `wandb/offline-run-20261106_202212-ku9idor5` (`ku9idor5`, not synced) |
+
+Command (runbook command; conda activated inside the tmux command):
+
+```
+--policy_class baseline --name baseline_lift_rand_v2_seed_0
+--dataset_suffix liftrand_eef_delta --num_side_cam 1 --n 3 --m 1
+--batch_size 32 --seed 0 --num_epochs 10001
+--eval_start_epoch 6000 --eval_every 500 --eval_max_steps 600
+--save_every 500 --lr 1e-4 --weight_decay 1e-6
+--ckpt_dir /data/zihan/campose_checkpoints/baseline_lift_rand_v2_seed_0
+```
+
+### Smoke test
+
+`baseline_lift_smoke_v2_seed_0`, 2 epochs, batch 4, 1 eval episode × 30 steps:
+
+- reported `train_loss 0.91884`, `val_loss 1.12284`; no shape errors or NaNs;
+- epoch-0 and epoch-1 eval both `Success = False` (expected, untrained);
+- artifacts: `config.json`, `dataset_stats.json`, `epoch_{0,1}.pth`,
+  `eval_epoch_{0,1}_agentview/` (videos + `success_by_seed.json`);
+- `dataset_stats.json` keys: `action_mean/std` (7), `state_mean/std` (7),
+  `eef_hist_mean/std` (44); **no** `eef_mean`/`eef_std`;
+- checkpoint contains `"baseline_arch": "spatial_softmax_nobs1_proprio7_v1"`.
+
+### Full run
+
+- Started 2026-11-06 20:22, ended 2026-11-07 04:07 (7 h 45 m wall clock).
+- 10000/10001 epochs (tqdm `10000/10001`). The 7.5 h guard fires inside the
+  checkpoint block, so it triggered at the epoch-10000 save before training
+  that final epoch. Relaunching would be a no-op (`ckpt epoch + 1 = 10001 =
+  --num_epochs`), so the run is effectively complete.
+- Final W&B summary: `train_loss 0.00455`, `val_loss 0.00214`,
+  `success_rate_agentview 0.36`.
+- Final checkpoint: `epoch_10000.pth` (3.1 GB, `loss 0.0045`, arch marker
+  correct); `epoch_9000/9500/10000` retained. Batch 32 fit without OOM
+  (~8.3 GB of 32 GB observed).
+- Evaluation every 500 epochs, 600 steps per episode: 10 episodes through
+  epoch 6000, 50 from epoch 6500 on. Only the first 10 episodes of each
+  evaluation are saved as videos (`eval_save_n_video=10`).
+
+### Results
+
+| Epoch | Episodes | Successes | Rate |
+|---:|---:|---:|---:|
+| 0 | 10 | 0 | 0.00 |
+| 500 | 10 | 0 | 0.00 |
+| 1000 | 10 | 0 | 0.00 |
+| 1500 | 10 | 0 | 0.00 |
+| 2000 | 10 | 1 | 0.10 |
+| 2500 | 10 | 2 | 0.20 |
+| 3000 | 10 | 3 | 0.30 |
+| 3500 | 10 | 4 | 0.40 |
+| 4000 | 10 | 2 | 0.20 |
+| 4500 | 10 | 0 | 0.00 |
+| 5000 | 10 | 1 | 0.10 |
+| 5500 | 10 | 1 | 0.10 |
+| 6000 | 10 | 0 | 0.00 |
+| 6500 | 50 | 7 | 0.14 |
+| 7000 | 50 | 12 | 0.24 |
+| 7500 | 50 | 12 | 0.24 |
+| 8000 | 50 | 19 | 0.38 |
+| 8500 | 50 | 18 | 0.36 |
+| 9000 | 50 | 21 | 0.42 |
+| 9500 | 50 | 25 | 0.50 |
+| 10000 | 50 | 18 | 0.36 |
+
+Across all 21 evaluations: **146/530 = 0.275**. Best: **25/50 = 0.50 at
+epoch 9500**; final: **18/50 = 0.36 at epoch 10000**. The non-monotonic
+stretch at epochs 4000–6000 is within the noise of 10-episode evaluations.
+
+### Encoder-sensitivity check (optional, final checkpoint)
+
+Same seeded diffusion noise, batch of 4, image input zeroed:
+
+| Input zeroed | Mean abs action change | Max abs change |
+|---|---:|---:|
+| Image (RGB + Plücker), v2 | **0.1079** | 2.0 |
+| Image (RGB + Plücker), v1 (reference §5) | 0.0005 | — |
+
+The v2 checkpoint is ~200× more sensitive to the image than the v1 checkpoint
+(reference action std 0.3745), so the encoder is using vision.
+
+### Evaluation videos
+
+Copied to `eval_videos/baseline_lift_rand_v2_seed_0/`: 21 epoch folders,
+210 MP4s, 21 `success_by_seed.json` (39 MB). See that folder's `README.md` for
+the per-epoch table. The checkpoints themselves stay on `/data`.
 
 <!-- ## 7. Current state / artefacts
 
