@@ -4,9 +4,13 @@ Session log for executing the baseline training runbooks (v1 and v2; now
 consolidated in `PLAN.md`) on this machine.
 Branch `method/baseline`; v1 runs at HEAD
 `7af6bfa0b18d932366ad775ef6b756d9c7e807aa`, v2 run at HEAD
-`a0b3e3d1694e1b60596b81ada259a5ff51f5b478`
-**Latest result (v2, §6):** Lift seed 0 reached **146/530 = 27.5%** success
+`a0b3e3d1694e1b60596b81ada259a5ff51f5b478`, v1-avgpool run at HEAD
+`a6049b472eebfd323acdeb9155aa32a0d5405c91`
+**v2 result (§6):** Lift seed 0 reached **146/530 = 27.5%** success
 (best 25/50 = 0.50 at epoch 9500; final 18/50 = 0.36).
+**Latest result (v1 avgpool, §7):** under the origin pose protocol, epoch 9500
+scored **31/50 (62%) on `train_cameras` and 29/50 (58%) on `test_cameras`**,
+well above v2 at the same epoch (17/50 and 17/50).
 
 <!-- ## 1. Machine and environment
 
@@ -394,6 +398,162 @@ dominant input.
 Copied to `eval_videos/baseline_lift_rand_v2_seed_0/`: 21 epoch folders,
 210 MP4s, 21 `success_by_seed.json` (39 MB). See that folder's `README.md` for
 the per-epoch table. The checkpoints themselves stay on `/data`.
+
+## 7. v1 (avgpool) run and origin pose-protocol evaluation (2026-11-07/09)
+
+Executes the consolidated `PLAN.md`: v1 is v2 with one change — ResNet18 layer4
+**global average pooling** instead of per-view spatial-softmax keypoints. All
+other conventions are identical (1-frame obs at `t`, actions `[t, t+16)`,
+7-D qpos zeroed before normalisation, `rgb/255` + raw Plücker, 44-D EEF-history
+FiLM, LiftRand seed 0, batch 32, LR 1e-4, 10001 epochs).
+
+### Run setup
+
+| Setting | Value |
+|---|---|
+| Git | `method/baseline`, HEAD `a6049b472eebfd323acdeb9155aa32a0d5405c91`, clean |
+| Env / GPU | `know_your_camera`, torch `2.11.0+cu128`; 2× RTX 5090; **GPU 1 only** (GPU 0 left for other users) |
+| Data | `liftrand_eef_delta.hdf5`, 300 demos (200 train + 10 validation) |
+| tmux / log | `campose_lift_avgpool`; `/data/zihan/campose_logs/baseline_lift_rand_avgpool_seed_0.log` |
+| Checkpoints | `/data/zihan/campose_checkpoints/baseline_lift_rand_avgpool_seed_0` |
+| Kept epoch 1000 | `..._keep/epoch_1000.pth` (+ `dataset_stats.json`, copied for offline eval) |
+| W&B offline | id `kbq1hhv5`; four dirs `wandb/offline-run-{20261107_182322,20261108_020908,20261108_102003,20261108_182822}-kbq1hhv5` |
+| Resume wrapper | `/data/zihan/campose_logs/run_avgpool_lift.sh` |
+
+Command (v2 command plus `--baseline_pool avgpool`):
+
+```
+--policy_class baseline --name baseline_lift_rand_avgpool_seed_0
+--dataset_suffix liftrand_eef_delta --num_side_cam 1 --n 3 --m 1
+--batch_size 32 --seed 0 --num_epochs 10001
+--eval_start_epoch 6000 --eval_every 500 --eval_max_steps 600
+--save_every 500 --baseline_pool avgpool
+--lr 1e-4 --weight_decay 1e-6
+--ckpt_dir /data/zihan/campose_checkpoints/baseline_lift_rand_avgpool_seed_0
+```
+
+### Smoke and preflight
+
+- `tests/test_baseline_encoder.py`: all 21 checks pass, including
+  `ok eval pose selection`; the refactored policy still loads the v2
+  `epoch_10000.pth` (same state-dict keys).
+- `baseline_lift_smoke_avgpool_seed_0` (2 epochs, batch 4, 1 episode × 30 steps):
+  `train_loss 0.86674`, `val_loss 1.17432`, no NaNs/shape errors.
+- Both pose sets evaluated at every epoch: `eval_epoch_{0,1}_{train,test}_cameras/`
+  with videos and `success_by_seed.json`.
+- `config.json`: `baseline_pool=avgpool`, `baseline_eval_agentview=false`.
+- `dataset_stats.json`: `action_*`/`state_*` (7) and `eef_hist_*` (44); no
+  `eef_mean`/`eef_std`.
+- `epoch_1.pth` marker: `avgpool_nobs1_proprio7_v1`.
+
+### Full run
+
+- Started 2026-11-07 18:23, completed 2026-11-09 00:44 (~30.4 h wall clock).
+- The 7.5 h guard stopped it three times; the wrapper relaunched the identical
+  command and resumed from the latest checkpoint: attempt 1 → epoch 3000,
+  attempt 2 → 6500, attempt 3 → 8500, attempt 4 → 10000 (`RUN COMPLETE`).
+- Much slower than the 9–10 h plan estimate because GPU 1 was shared with three
+  other-user processes (~21 GB, 57–69% utilisation): ~5–6 s/it vs v2's ~2.8 s/it.
+- Final checkpoint losses (finite): epoch 9000/9500/10000 =
+  0.0035/0.0037/0.0041. No OOM; batch 32 throughout; EGL worked.
+- `cleanup_ckpt(keep=3)` removed the epoch-1000 checkpoint; a watcher had
+  hardlinked it to `..._keep/` at 2026-11-07 20:56.
+
+### v1 online results by epoch × pose set
+
+The training loop evaluates both pose files (episode `i` uses pose `i`):
+10 episodes through epoch 6000, 50 from epoch 6500 on; 600 steps.
+
+| Epoch | train_cameras | test_cameras |
+|---:|---:|---:|
+| 0 | 0/10 (0%) | 0/10 (0%) |
+| 500 | 0/10 | 0/10 |
+| 1000 | 0/10 | 0/10 |
+| 1500 | 0/10 | 0/10 |
+| 2000 | 1/10 (10%) | 4/10 (40%) |
+| 2500 | 0/10 | 1/10 (10%) |
+| 3000 | 4/10 (40%) | 2/10 (20%) |
+| 3500 | 3/10 (30%) | 1/10 (10%) |
+| 4000 | 5/10 (50%) | 3/10 (30%) |
+| 4500 | 3/10 (30%) | 3/10 (30%) |
+| 5000 | 5/10 (50%) | 4/10 (40%) |
+| 5500 | 4/10 (40%) | 1/10 (10%) |
+| 6000 | 1/10 (10%) | 4/10 (40%) |
+| 6500 | 24/50 (48%) | 19/50 (38%) |
+| 7000 | 24/50 (48%) | 20/50 (40%) |
+| 7500 | 24/50 (48%) | 22/50 (44%) |
+| 8000 | 30/50 (60%) | 27/50 (54%) |
+| 8500 | 30/50 (60%) | 26/50 (52%) |
+| 9000 | 29/50 (58%) | 27/50 (54%) |
+| 9500 | **31/50 (62%)** | **29/50 (58%)** |
+| 10000 | 25/50 (50%) | 27/50 (54%) |
+
+### Part B — v2 re-evaluated under the origin pose protocol
+
+v2's original run was agentview-only. Its retained checkpoints were evaluated
+offline with the same `BaselineEvaluator` (`eval_baseline_checkpoint.py`), pose
+files and episode seeds. Object placement is seeded by `episode_num`; diffusion
+noise by `(episode_num+1)*100003+step`, so v1 and v2 see identical initial
+states and noise (paired comparison).
+
+| Model | Checkpoint | train_cameras (50) | test_cameras (50) | agentview ref. |
+|---|---|---:|---:|---:|
+| v2 (`spatial_softmax`) | epoch 1000 | 0/50 (0%) | 2/50 (4%) | — |
+| v1 (`avgpool`, offline) | epoch 1000 | 0/50 (0%) | 0/50 (0%) | — |
+| v2 (`spatial_softmax`) | epoch 9500 | 17/50 (34%) | 17/50 (34%) | 25/50 (old protocol) |
+| v2 (`spatial_softmax`) | epoch 10000 | 19/50 (38%) | 19/50 (38%) | 18/50 (old protocol) |
+| v1 (`avgpool`) | epoch 9500 | **31/50 (62%)** | **29/50 (58%)** | — |
+| v1 (`avgpool`) | epoch 10000 | 25/50 (50%) | 27/50 (54%) | — |
+
+Offline outputs: `/data/zihan/campose_eval/v2_epoch{1000,9500,10000}_poses/` and
+`/data/zihan/campose_eval/avgpool_epoch1000_poses/` (`summary.json` per pose
+set).
+
+Paired per-episode comparison (identical episodes):
+
+| Epoch | Pose set | both | v1-only | v2-only | neither | McNemar exact p |
+|---|---:|---:|---:|---:|---:|---:|
+| 9500 | train | 13 | 18 | 4 | 15 | |
+| 9500 | test | 15 | 14 | 2 | 19 | |
+| 9500 | combined | 28 | 32 | 6 | 34 | <0.0001 |
+| 10000 | train | 12 | 13 | 7 | 18 | |
+| 10000 | test | 14 | 13 | 5 | 18 | |
+| 10000 | combined | 26 | 26 | 12 | 36 | 0.034 |
+
+### Interpretation
+
+- **v1 avgpool beats v2 spatial-softmax on both pose sets**, including held-out
+  views: +14 successes on `train_cameras` and +12 on `test_cameras` at epoch
+  9500 (paired p<0.0001 combined), and +6/+8 at epoch 10000 (p=0.034).
+- The plan's first hypothesis — v2 keeps its success on `test_cameras` while v1
+  does not — is **not supported**. Held-out-view retention is near-perfect for
+  both: v1 test/train = 29/31 (0.94) at 9500 and 27/25 (1.08) at 10000; v2 is
+  exactly equal on both sets (17/17 and 19/19).
+- The second hypothesis is supported: **global average pooling is sufficient
+  for LiftRand**, and the earlier v1 collapse (§5) was due to the 9-D EEF-state
+  shortcut and input conventions, not pooling. This is consistent with §6's
+  no-state v1 ablation, which already reached 4/10 at epoch 1000.
+- Caveats: one seed; 50-episode rates carry ~7% standard error; v1's epoch
+  10000 is below its epoch-9500 train score (25 vs 31), so treat 9500 as the
+  best checkpoint rather than reading a trend into the last 500 epochs.
+- v2's agentview reference column is a different protocol and is not
+  comparable to the pose-set columns.
+
+### Deviations
+
+- All training and evaluation used **GPU 1 only**. The v2 offline eval was
+  briefly started on GPU 0; it was stopped immediately when asked to leave GPU 0
+  for other users and restarted on GPU 1. Every process was verified to have
+  `CUDA_VISIBLE_DEVICES=1`.
+- The 7.5 h guard required three resumes;
+  `/data/zihan/campose_logs/run_avgpool_lift.sh` automates the relaunch with the
+  identical command (no parameter changes).
+- `dataset_stats.json` was copied into the `_keep` directory because
+  `eval_baseline_checkpoint.py` loads it from the checkpoint's directory.
+- The run took ~30.4 h instead of 9–10 h because GPU 1 was shared with other
+  users' jobs; batch stayed 32, with no OOM, no EGL fallback and no NaNs.
+- The known non-blocking `⚠️ Render fault detected; rebuilding context` line
+  appeared during/after evaluation, as in §6.
 
 <!-- ## 7. Current state / artefacts
 
