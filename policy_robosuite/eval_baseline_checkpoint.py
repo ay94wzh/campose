@@ -6,6 +6,10 @@ existing checkpoint plus its ``dataset_stats.json`` and runs the same
 camera pose per episode, matching the origin ``Evaluator`` with
 ``num_side_cam=1``).
 
+Add ``--eval_num_views 2 --eval_view_sampling random`` to evaluate the K=2
+fusion path with two distinct poses drawn uniformly from the pose file per
+episode (fixed for that episode; reproducible via ``--eval_pose_seed``).
+
 Run from the repo root, e.g.:
 
     python policy_robosuite/eval_baseline_checkpoint.py \
@@ -96,6 +100,27 @@ def main():
     parser.add_argument("--eval_save_n_video", type=int, default=2)
     parser.add_argument("--num_side_cam", type=int, default=1, choices=[1])
     parser.add_argument(
+        "--eval_num_views",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="views fed to the policy at eval; 1 is the origin protocol",
+    )
+    parser.add_argument(
+        "--eval_view_sampling",
+        type=str,
+        default="fixed",
+        choices=["fixed", "adjacent", "random"],
+        help="with eval_num_views=2: fixed duplicates pose i; adjacent uses "
+        "poses[2i], poses[2i+1]; random draws 2 distinct poses from the file",
+    )
+    parser.add_argument(
+        "--eval_pose_seed",
+        type=int,
+        default=0,
+        help="seed for random view sampling (pair = seed + episode)",
+    )
+    parser.add_argument(
         "--baseline_pool",
         type=str,
         default="spatial_softmax",
@@ -146,7 +171,10 @@ def main():
         eval_max_steps=args.eval_max_steps,
         eval_save_n_video=args.eval_save_n_video,
         camera_poses_dir=args.camera_poses_dir,
-        num_side_cam=args.num_side_cam,
+        num_side_cam=args.eval_num_views,
+        eval_num_views=args.eval_num_views,
+        eval_view_sampling=args.eval_view_sampling,
+        eval_pose_seed=args.eval_pose_seed,
         default_cam=False,
         pose_files=[] if args.agentview else args.pose_files,
         prob_drop_proprio=1.0,
@@ -190,6 +218,9 @@ def main():
             "successes": int(sum(successes)),
             "rate": float(np.mean(successes)) if successes else 0.0,
             "baseline_pool": args.baseline_pool,
+            "eval_num_views": args.eval_num_views,
+            "eval_view_sampling": args.eval_view_sampling,
+            "eval_pose_seed": args.eval_pose_seed,
             "checkpoint": os.path.abspath(args.ckpt),
         }
         with open(os.path.join(save_path, "summary.json"), "w") as f:

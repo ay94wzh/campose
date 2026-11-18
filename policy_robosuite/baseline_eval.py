@@ -50,7 +50,15 @@ class BaselineEvaluator(Evaluator):
             env=env, norm_stats=norm_stats, dataset_path=dataset_path, args=args
         )
         self.device = torch.device("cuda")
-        self.num_side_cam = 1
+        # The origin protocol is K=1.  The standalone eval script can opt into
+        # K=2 with `--eval_num_views 2` and `--eval_view_sampling random`.
+        # Defaults preserve the existing (single-view) behaviour exactly.
+        self.eval_num_views = int(getattr(args, "eval_num_views", 1))
+        self.eval_view_sampling = getattr(
+            args, "eval_view_sampling", "fixed"
+        )
+        self.eval_pose_seed = int(getattr(args, "eval_pose_seed", 0))
+        self.num_side_cam = self.eval_num_views
 
         self.eef_site_id = find_eef_site_id(self.env)
         self.eef_body_name = find_eef_body_name(self.env)
@@ -68,8 +76,10 @@ class BaselineEvaluator(Evaluator):
         )
         self.agentview_plucker = self._compute_plucker(self.agentview_c2w)
 
-        # Per-episode camera pose/Plücker; agentview until _evaluate_impl
-        # selects the pose for the requested pose_name/episode.
+        # Per-episode camera poses/Plückers; agentview until _evaluate_impl
+        # selects the pose(s) for the requested pose_name/episode.
+        self.current_c2ws = [self.agentview_c2w] * self.eval_num_views
+        self.current_pluckers = [self.agentview_plucker] * self.eval_num_views
         self.current_c2w = self.agentview_c2w
         self.current_plucker = self.agentview_plucker
 
@@ -105,6 +115,38 @@ class BaselineEvaluator(Evaluator):
             self.agentview_c2w,
         )
 
+    def _select_eval_poses(self, pose_name, episode_num):
+        """Camera-to-world poses for one evaluation episode.
+
+        ``fixed`` (default) is the origin K=1 protocol.  With K=2:
+        ``adjacent`` uses ``poses[2*i], poses[2*i+1]``; ``random`` draws two
+        distinct poses uniformly without replacement from the whole pose file,
+        seeded by ``eval_pose_seed + episode_num`` so the pair is fixed for the
+        episode and reproducible.
+        """
+        n = self.eval_num_views
+        if self.args.default_cam or pose_name == "agentview":
+            return [np.asarray(self.agentview_c2w, dtype=np.float32)] * n
+
+        poses = self.camera_poses_by_name[pose_name]
+        mode = self.eval_view_sampling
+        if n == 1 or mode == "fixed":
+            base = self._select_eval_pose(pose_name, episode_num)
+            return [base] * n
+        if mode == "adjacent":
+            idx = [2 * episode_num + k for k in range(n)]
+            if idx[-1] >= len(poses):
+                raise IndexError(
+                    f"adjacent pose indices {idx} out of range for "
+                    f"{pose_name!r} ({len(poses)} poses)"
+                )
+            return [np.asarray(poses[i], dtype=np.float32) for i in idx]
+        if mode == "random":
+            rng = np.random.default_rng(self.eval_pose_seed + int(episode_num))
+            idx = rng.choice(len(poses), size=n, replace=False)
+            return [np.asarray(poses[int(i)], dtype=np.float32) for i in idx]
+        raise ValueError(f"unknown eval_view_sampling {mode!r}")
+
     def _set_eval_camera(self):
         """Point the agentview camera at the episode's selected pose."""
         self._set_camera_pose(self.current_c2w)
@@ -126,24 +168,34 @@ class BaselineEvaluator(Evaluator):
         return np.concatenate(steps, axis=0).astype(np.float32)
 
     def _snapshot(self, eef_deque):
-        """Render agentview and build one B1 observation frame."""
-        rgb = self._render_cam_image(None)
-        rgb_t = (
-            torch.from_numpy(rgb).float().permute(2, 0, 1).to(self.device) / 255.0
-        )
-        image = torch.cat([rgb_t, self.current_plucker], dim=0)  # (9, H, W)
+        """Render all active views and build one B1 observation frame."""
+        images, hists = [], []
+        first_rgb = None
+        for c2w, plucker in zip(self.current_c2ws, self.current_pluckers):
+            self._set_camera_pose(c2w)
+            rgb = self._render_cam_image(None)
+            if first_rgb is None:
+                first_rgb = rgb
+            rgb_t = (
+                torch.from_numpy(rgb).float().permute(2, 0, 1).to(self.device)
+                / 255.0
+            )
+            images.append(torch.cat([rgb_t, plucker], dim=0))  # (9, H, W)
 
-        cam_pos, cam_quat_wxyz = cam_c2w_to_pos_quat(self.current_c2w)
-        hist = self._eef_history(eef_deque, cam_pos, cam_quat_wxyz)
-        hist = (hist - self.eef_hist_mean) / self.eef_hist_std
+            cam_pos, cam_quat_wxyz = cam_c2w_to_pos_quat(c2w)
+            hist = self._eef_history(eef_deque, cam_pos, cam_quat_wxyz)
+            hist = (hist - self.eef_hist_mean) / self.eef_hist_std
+            hists.append(torch.from_numpy(hist).to(self.device))
 
         return {
-            "rgb": rgb,
-            "image": image.unsqueeze(0),  # (1, 9, H, W)
+            "rgb": first_rgb,
+            "image": torch.stack(images, dim=0),  # (K, 9, H, W)
             # Raw qpos; the dropout and normalisation happen once per replan.
             "proprio_raw": self.env.sim.data.qpos[:PROPRIO_DIM].copy(),
-            "eef_hist": torch.from_numpy(hist).to(self.device).unsqueeze(0),
-            "view_mask": torch.ones(1, dtype=torch.bool, device=self.device),
+            "eef_hist": torch.stack(hists, dim=0),  # (K, 44)
+            "view_mask": torch.ones(
+                self.eval_num_views, dtype=torch.bool, device=self.device
+            ),
         }
 
     # ----------------------------------------------------------------- rollout
@@ -187,8 +239,12 @@ class BaselineEvaluator(Evaluator):
         else:
             self.env.reset()
 
-        self.current_c2w = self._select_eval_pose(pose_name, episode_num)
-        self.current_plucker = self._compute_plucker(self.current_c2w)
+        self.current_c2ws = self._select_eval_poses(pose_name, episode_num)
+        self.current_pluckers = [
+            self._compute_plucker(c2w) for c2w in self.current_c2ws
+        ]
+        self.current_c2w = self.current_c2ws[0]
+        self.current_plucker = self.current_pluckers[0]
         self._set_eval_camera()
 
         if self.action_space in ("eef_delta", "joint_delta"):
