@@ -29,6 +29,10 @@ from baseline_common import (
     HORIZON,
     IMAGE_SIZE,
     PROPRIO_DIM,
+    RECON_MODES,
+    TARGET_IMAGE_SIZE,
+    TARGET_POS_JITTER,
+    TARGET_ROT_JITTER_DEG,
     action_window_indices,
     apply_shared_crop,
     cam_c2w_to_pos_quat,
@@ -42,7 +46,9 @@ from baseline_common import (
     normalize_proprio,
     quat_xyzw_to_wxyz,
     quat_wxyz_to_mat,
+    sample_target_pose,
     shared_crop_params,
+    target_pose_rng,
 )
 from cam_embedding import PluckerEmbedder
 from utils import EpisodicDataset, get_norm_stats
@@ -87,6 +93,14 @@ def _read_eef_obs(dataset_file, demo_idx, states, env=None):
     return _eef_from_states(states, env)
 
 
+def _capture_agentview_c2w(env):
+    """Read the current default agentview pose as a camera-to-world matrix."""
+    cam_id = env.sim.model.camera_name2id("agentview")
+    pos = env.sim.model.cam_pos[cam_id].copy()
+    quat_wxyz = env.sim.model.cam_quat[cam_id].copy()
+    return c2w_from_pos_quat(pos, quat_wxyz)
+
+
 class BaselineEpisodicDataset(EpisodicDataset):
     """Episodic dataset returning B1's single-frame / history / mask tensors."""
 
@@ -98,6 +112,7 @@ class BaselineEpisodicDataset(EpisodicDataset):
         camera_poses_file=None,
         transform="crop",
         env=None,
+        default_agentview_c2w=None,
     ):
         if transform not in ("crop", "id"):
             raise ValueError(
@@ -140,6 +155,39 @@ class BaselineEpisodicDataset(EpisodicDataset):
         self.demo_grip = []
         self._load_eef_arrays()
         self._report_camera_coverage()
+
+        # Training-only target-view reconstruction configuration.  Target
+        # poses are sampled once per demo (episode) and cached, so they stay
+        # fixed across timesteps and epochs.
+        self.recon_mode = getattr(args, "recon_mode", "none")
+        if self.recon_mode is None:
+            self.recon_mode = "none"
+        if self.recon_mode not in RECON_MODES:
+            raise ValueError(
+                f"unknown recon_mode {self.recon_mode!r}; expected {RECON_MODES}"
+            )
+        self.target_pos_jitter = float(
+            getattr(args, "target_pos_jitter", TARGET_POS_JITTER)
+        )
+        self.target_rot_jitter_deg = float(
+            getattr(args, "target_rot_jitter_deg", TARGET_ROT_JITTER_DEG)
+        )
+        self._needs_target_plucker = self.recon_mode in (
+            "single_plucker",
+            "multi_plucker",
+        )
+        self._target_cache = {}
+        self.default_agentview_c2w = None
+        if self.recon_mode != "none":
+            if default_agentview_c2w is None:
+                if self.env is None:
+                    raise RuntimeError(
+                        "recon_mode needs env to read the default agentview pose"
+                    )
+                default_agentview_c2w = _capture_agentview_c2w(self.env)
+            self.default_agentview_c2w = np.asarray(
+                default_agentview_c2w, dtype=np.float32
+            )
 
     def _report_camera_coverage(self):
         """Warn when the n/m windows leave most of the pose set unused."""
@@ -226,6 +274,51 @@ class BaselineEpisodicDataset(EpisodicDataset):
         cropped = [apply_shared_crop(img, params) for img in images]
         return torch.stack(cropped, dim=0), c2w
 
+    def _target_entry(self, demo_idx):
+        """Fixed target pose (and optional raw Plücker map) for one demo."""
+        gid = int(self.demo_indices[demo_idx])
+        entry = self._target_cache.get(gid)
+        if entry is not None:
+            return entry
+
+        c2w = sample_target_pose(
+            self.default_agentview_c2w,
+            target_pose_rng(getattr(self.args, "seed", 0), gid),
+            self.target_pos_jitter,
+            self.target_rot_jitter_deg,
+        )
+        plucker = None
+        if self._needs_target_plucker:
+            intrinsics = self._get_camera_intrinsics()
+            k_t = torch.from_numpy(intrinsics).unsqueeze(0).float().cuda()
+            t_t = torch.from_numpy(c2w).unsqueeze(0).float().cuda()
+            with torch.no_grad():
+                p = self.plucker_embedder(k_t, t_t)["plucker"][0]
+            # (256, 256, 6) -> (6, 256, 256); raw Plücker only, fp16 CPU cache.
+            plucker = p.permute(2, 0, 1).contiguous().half().cpu()
+
+        entry = {"c2w": c2w, "plucker": plucker}
+        self._target_cache[gid] = entry
+        return entry
+
+    def _render_target_image(self, states, frame_idx, c2w):
+        """Render the target view at the same state as the input observation."""
+        self._set_camera_pose(np.asarray(c2w, dtype=np.float32))
+        try:
+            self.env.sim.set_state_from_flattened(states[frame_idx])
+            self.env.sim.forward()
+            rgb = self.env.sim.render(
+                camera_name="agentview",
+                height=TARGET_IMAGE_SIZE,
+                width=TARGET_IMAGE_SIZE,
+                depth=False,
+            )
+            rgb = np.flipud(rgb).copy()
+            return torch.from_numpy(rgb).float().permute(2, 0, 1) / 255.0
+        finally:
+            # The camera is shared across views, datasets and the evaluator.
+            self._set_camera_pose(self.default_agentview_c2w)
+
     def __getitem__(self, demo_idx):
         demo_length = self.demo_lengths[demo_idx]
         states = self.demo_states[demo_idx]
@@ -297,7 +390,7 @@ class BaselineEpisodicDataset(EpisodicDataset):
         is_pad = ~valid
         act = (act - self.action_mean) / self.action_std
 
-        return {
+        out = {
             "image": image.cuda(),
             "proprio": proprio_t.cuda(),
             "eef_hist": eef_hist_t.cuda(),
@@ -305,6 +398,18 @@ class BaselineEpisodicDataset(EpisodicDataset):
             "actions": torch.from_numpy(act).float().cuda(),
             "is_pad": torch.from_numpy(is_pad).cuda(),
         }
+
+        if self.recon_mode != "none":
+            entry = self._target_entry(demo_idx)
+            out["target_image"] = self._render_target_image(
+                states, t, entry["c2w"]
+            ).cuda()
+            if entry["plucker"] is not None:
+                out["target_plucker"] = entry["plucker"].to(
+                    device="cuda", dtype=torch.float32
+                )
+
+        return out
 
 
 def _load_train_camera_poses(args, env):
@@ -398,6 +503,16 @@ def load_baseline_data(args, env, val_split=0.1):
     )
     print("Normalization statistics computed.")
 
+    # Capture the default agentview pose once, before any dataset rendering can
+    # mutate the shared sim camera; both datasets must use the same base pose.
+    default_agentview_c2w = None
+    if getattr(args, "recon_mode", "none") not in (None, "none"):
+        if env is None:
+            raise RuntimeError(
+                "recon_mode needs env for the default agentview pose"
+            )
+        default_agentview_c2w = _capture_agentview_c2w(env)
+
     train_dataset = BaselineEpisodicDataset(
         train_indices,
         norm_stats,
@@ -405,6 +520,7 @@ def load_baseline_data(args, env, val_split=0.1):
         camera_poses_file=args.train_poses_file,
         transform=args.transform,
         env=env,
+        default_agentview_c2w=default_agentview_c2w,
     )
     val_dataset = BaselineEpisodicDataset(
         val_indices,
@@ -413,6 +529,7 @@ def load_baseline_data(args, env, val_split=0.1):
         camera_poses_file=args.test_poses_file,
         transform="id",
         env=env,
+        default_agentview_c2w=default_agentview_c2w,
     )
 
     max_seq_length = train_dataset.max_seq_length

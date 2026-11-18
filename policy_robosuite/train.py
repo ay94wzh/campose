@@ -16,7 +16,13 @@ from models.act import ACTPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
-from baseline_common import baseline_arch_name
+from baseline_common import (
+    RECON_MODES,
+    RECON_WEIGHT,
+    TARGET_POS_JITTER,
+    TARGET_ROT_JITTER_DEG,
+    baseline_arch_name,
+)
 from baseline_data import load_baseline_data
 from baseline_eval import BaselineEvaluator
 from models.baseline import BaselineDiffusionPolicy
@@ -193,7 +199,14 @@ def main(args, ckpt=None):
                 'loss': summary['loss'] if summary is not None else None,
                 'wandb_id': wandb.run.id,
                 'eef_hist_norm': True,
-                'baseline_arch': baseline_arch_name(args.baseline_pool),
+                'baseline_arch': baseline_arch_name(
+                    args.baseline_pool, args.recon_mode
+                ),
+                'recon_mode': args.recon_mode,
+                'recon_weight': args.recon_weight,
+                'target_pos_jitter': args.target_pos_jitter,
+                'target_rot_jitter_deg': args.target_rot_jitter_deg,
+                'seed': args.seed,
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
@@ -254,6 +267,17 @@ if __name__ == '__main__':
                         help='baseline encoder per-view pooling; avgpool is the v1-parity ablation')
     parser.add_argument('--baseline_eval_agentview', type=str2bool, default=False,
                         help='baseline only: evaluate on the fixed agentview instead of the pose files')
+    parser.add_argument('--recon_mode', type=str, default='none',
+                        choices=list(RECON_MODES),
+                        help='baseline only: training-time target-view reconstruction mode '
+                             '(none=baseline, z_only=Exp A, single_plucker=Exp B, '
+                             'multi_plucker=Exp C)')
+    parser.add_argument('--recon_weight', type=float, default=RECON_WEIGHT,
+                        help='lambda_a: weight of the L1 target-view reconstruction loss')
+    parser.add_argument('--target_pos_jitter', type=float, default=TARGET_POS_JITTER,
+                        help='target camera translation jitter in metres (camera-local, uniform +/-)')
+    parser.add_argument('--target_rot_jitter_deg', type=float, default=TARGET_ROT_JITTER_DEG,
+                        help='target camera per-axis rotation jitter in degrees')
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
@@ -351,13 +375,24 @@ if __name__ == '__main__':
                 "resuming would silently change the FiLM input scale. "
                 "Retrain with a fresh --name."
             )
-        selected_arch = baseline_arch_name(args.baseline_pool)
+        selected_arch = baseline_arch_name(
+            args.baseline_pool, args.recon_mode
+        )
         if args.policy_class == 'baseline' and ckpt.get('baseline_arch') != selected_arch:
             raise RuntimeError(
                 "This baseline checkpoint was trained with a different encoder "
                 "architecture (checkpoint 'baseline_arch' != "
                 f"{selected_arch!r}); its state_dict is incompatible. Retrain "
                 "with a fresh --name."
+            )
+        if (
+            args.policy_class == 'baseline'
+            and ckpt.get('recon_mode', 'none') != args.recon_mode
+        ):
+            raise RuntimeError(
+                "This baseline checkpoint was trained with recon_mode="
+                f"{ckpt.get('recon_mode', 'none')!r}, but --recon_mode is "
+                f"{args.recon_mode!r}; retrain or resume with the matching mode."
             )
         wandb_id = ckpt['wandb_id']
         wandb.init(project='test', id=wandb_id, resume='must', group=group)

@@ -41,9 +41,12 @@ from baseline_common import (
     FUSED_DIM,
     OBS_FEATURE_DIM,
     PROPRIO_DIM,
+    RECON_MODES,
+    RECON_WEIGHT,
     SpatialSoftmax,
     replace_bn_with_gn,
 )
+from .baseline_recon import TargetViewReconstructor
 
 
 class BaselineEncoder(nn.Module):
@@ -291,6 +294,24 @@ class BaselineDiffusionPolicy(nn.Module):
             clip_sample_range=1.0,
         )
 
+        # Training-only auxiliary target-view reconstruction branch.  Build it
+        # after the existing modules so parameter order (and AdamW state) for
+        # recon_mode='none' is unchanged.
+        self.recon_mode = getattr(args, "recon_mode", "none")
+        if self.recon_mode is None:
+            self.recon_mode = "none"
+        if self.recon_mode not in RECON_MODES:
+            raise ValueError(
+                f"unknown recon_mode {self.recon_mode!r}; expected {RECON_MODES}"
+            )
+        self.recon_weight = float(getattr(args, "recon_weight", RECON_WEIGHT))
+        if self.recon_mode == "none":
+            self.recon_branch = None
+        else:
+            self.recon_branch = TargetViewReconstructor(
+                fused_dim=FUSED_DIM, mode=self.recon_mode
+            )
+
     def configure_optimizers(self):
         return torch.optim.AdamW(
             self.parameters(),
@@ -326,14 +347,24 @@ class BaselineDiffusionPolicy(nn.Module):
         eef_hist = eef_hist.reshape(b * to, k, -1)
         view_mask = view_mask.reshape(b * to, k)
 
-        z = self.encoder(image, proprio, eef_hist, view_mask)
+        full = self.encoder.forward_full(image, proprio, eef_hist, view_mask)
+        z = full["out"]
         if z.shape != (b * to, self.obs_feature_dim):
             raise ValueError(
                 f"encoder returned {tuple(z.shape)}, expected "
                 f"({b * to}, {self.obs_feature_dim})"
             )
         global_cond = z.reshape(b, -1)
-        return None, global_cond
+        # z_global is the 512-D fused view feature (without proprio), used by
+        # the auxiliary reconstruction branch.  The recon objective is defined
+        # for the single observation frame used by this policy.
+        z_global = full["z_global"].reshape(b, to, self.encoder.fused_dim)
+        if self.recon_mode != "none" and to != 1:
+            raise ValueError(
+                f"recon_mode={self.recon_mode!r} assumes n_obs_steps=1, "
+                f"got {to}"
+            )
+        return None, global_cond, z_global[:, -1]
 
     @torch.no_grad()
     def _sample(self, batch_size, global_cond, generator=None):
@@ -355,8 +386,36 @@ class BaselineDiffusionPolicy(nn.Module):
             ).prev_sample
         return sample
 
+    def _recon_loss(self, z_global, data_dict):
+        """L1 target-view reconstruction loss for one training batch."""
+        if self.recon_branch is None:
+            raise RuntimeError("recon branch is not enabled")
+        target = data_dict.get("target_image")
+        if target is None:
+            raise KeyError(
+                f"recon_mode={self.recon_mode!r} requires target_image"
+            )
+        target = target.float()
+
+        target_plucker = None
+        if self.recon_mode != "z_only":
+            target_plucker = data_dict.get("target_plucker")
+            if target_plucker is None:
+                raise KeyError(
+                    f"recon_mode={self.recon_mode!r} requires target_plucker"
+                )
+            target_plucker = target_plucker.float()
+
+        pred = self.recon_branch(z_global, target_plucker)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"reconstruction shape {tuple(pred.shape)} does not match "
+                f"target_image {tuple(target.shape)}"
+            )
+        return F.l1_loss(pred.float(), target)
+
     def __call__(self, data_dict, generator=None):
-        _, global_cond = self._build_conds(data_dict)
+        _, global_cond, z_global = self._build_conds(data_dict)
         actions = data_dict.get("actions")
 
         if actions is not None:
@@ -370,16 +429,29 @@ class BaselineDiffusionPolicy(nn.Module):
                 device=actions.device,
             ).long()
             noisy = self.noise_scheduler.add_noise(actions, noise, timesteps)
-            pred = self.unet(noisy, timesteps, global_cond=global_cond)
-            loss = F.mse_loss(pred, noise, reduction="none")
+            noise_pred = self.unet(noisy, timesteps, global_cond=global_cond)
+            loss_diffusion = F.mse_loss(noise_pred, noise, reduction="none")
             is_pad = data_dict.get("is_pad")
             if is_pad is not None:
                 is_pad = is_pad[:, : self.horizon].to(actions.device).bool()
-                valid = (~is_pad).unsqueeze(-1).expand_as(loss).float()
-                loss = (loss * valid).sum() / valid.sum().clamp_min(1.0)
+                valid = (~is_pad).unsqueeze(-1).expand_as(loss_diffusion).float()
+                loss_diffusion = (loss_diffusion * valid).sum() / valid.sum().clamp_min(1.0)
             else:
-                loss = loss.mean()
-            return {"loss": loss}
+                loss_diffusion = loss_diffusion.mean()
+
+            if self.recon_branch is None:
+                return {
+                    "loss": loss_diffusion,
+                    "loss_diffusion": loss_diffusion,
+                }
+
+            loss_recon = self._recon_loss(z_global, data_dict)
+            loss = loss_diffusion + self.recon_weight * loss_recon
+            return {
+                "loss": loss,
+                "loss_diffusion": loss_diffusion,
+                "loss_recon": loss_recon,
+            }
 
         batch_size = global_cond.shape[0]
         sample = self._sample(batch_size, global_cond, generator=generator)

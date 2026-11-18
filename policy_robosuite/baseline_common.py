@@ -50,21 +50,43 @@ IMAGE_SIZE = 256
 CROP_MIN_SIDE = int(IMAGE_SIZE * 0.8)  # 204, mirrors CamPose's RandomCrop
 CROP_MAX_SIDE = IMAGE_SIZE
 
+# Training-only target-view reconstruction branch (AGENTPLAN.md).
+TARGET_IMAGE_SIZE = 128
+TARGET_POS_JITTER = 0.02  # metres, camera-local, uniform +/-
+TARGET_ROT_JITTER_DEG = 5.0  # degrees, per camera-local axis, uniform +/-
+RECON_WEIGHT = 0.1
+RECON_MODES = ("none", "z_only", "single_plucker", "multi_plucker")
+BASELINE_RECON_TAG = "_recon_"
+
 # Bump whenever the encoder or input normalisation changes; stored in every
 # baseline checkpoint so stale weights cannot be resumed silently.
 BASELINE_ARCH = "spatial_softmax_nobs1_proprio7_v1"
 BASELINE_ARCH_AVGPOOL = "avgpool_nobs1_proprio7_v1"
 
 
-def baseline_arch_name(pool: str = "spatial_softmax") -> str:
-    """Checkpoint architecture marker for the selected per-view pooling."""
+def baseline_arch_name(
+    pool: str = "spatial_softmax", recon_mode: str = "none"
+) -> str:
+    """Checkpoint architecture marker for pooling + optional recon branch.
+
+    ``recon_mode='none'`` preserves the historical markers exactly, so old
+    checkpoints keep loading.  Recon runs append a distinct suffix.
+    """
     if pool == "spatial_softmax":
-        return BASELINE_ARCH
-    if pool == "avgpool":
-        return BASELINE_ARCH_AVGPOOL
-    raise ValueError(
-        f"unknown baseline pooling {pool!r}; expected 'spatial_softmax' or 'avgpool'"
-    )
+        base = BASELINE_ARCH
+    elif pool == "avgpool":
+        base = BASELINE_ARCH_AVGPOOL
+    else:
+        raise ValueError(
+            f"unknown baseline pooling {pool!r}; expected 'spatial_softmax' or 'avgpool'"
+        )
+    if recon_mode is None or recon_mode == "none":
+        return base
+    if recon_mode not in RECON_MODES:
+        raise ValueError(
+            f"unknown recon_mode {recon_mode!r}; expected one of {RECON_MODES}"
+        )
+    return f"{base}{BASELINE_RECON_TAG}{recon_mode}"
 
 
 def select_eval_pose(
@@ -163,6 +185,50 @@ def c2w_from_pos_quat(pos, quat_wxyz):
     T[:3, :3] = R
     T[:3, 3] = np.asarray(pos, dtype=np.float32)
     return T
+
+
+def target_pose_rng(seed: int, global_demo_id: int) -> np.random.Generator:
+    """Deterministic RNG for one demo's fixed target pose.
+
+    Uses a tuple seed so the target pose is reproducible across dataset
+    re-creation (resume) and independent of the global ``np.random`` stream.
+    """
+    return np.random.default_rng(
+        np.random.SeedSequence([int(seed), int(global_demo_id)])
+    )
+
+
+def sample_target_pose(
+    default_c2w,
+    rng: np.random.Generator,
+    pos_jitter: float = TARGET_POS_JITTER,
+    rot_jitter_deg: float = TARGET_ROT_JITTER_DEG,
+) -> np.ndarray:
+    """Perturb the default agentview pose in its camera-local frame.
+
+    ``T_a = T_default @ DeltaT``.  Translation components are uniform in
+    ``[-pos_jitter, pos_jitter]`` along the camera-local axes; rotation is
+    Euler xyz with each component uniform in ``[-rot_jitter_deg,
+    rot_jitter_deg]``.  Returns a float32 (4, 4) camera-to-world matrix.
+    """
+    default_c2w = np.asarray(default_c2w, dtype=np.float64)
+    if default_c2w.shape != (4, 4):
+        raise ValueError(
+            f"default_c2w must be (4, 4), got {default_c2w.shape}"
+        )
+    if not np.allclose(default_c2w[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+        raise ValueError("default_c2w bottom row must be [0, 0, 0, 1]")
+    R = default_c2w[:3, :3]
+    if not np.allclose(R @ R.T, np.eye(3), atol=1e-4):
+        raise ValueError("default_c2w rotation is not orthonormal")
+    if pos_jitter < 0 or rot_jitter_deg < 0:
+        raise ValueError("jitter magnitudes must be non-negative")
+
+    delta = np.eye(4, dtype=np.float64)
+    angles = rng.uniform(-rot_jitter_deg, rot_jitter_deg, size=3)
+    delta[:3, :3] = Rotation.from_euler("xyz", angles, degrees=True).as_matrix()
+    delta[:3, 3] = rng.uniform(-pos_jitter, pos_jitter, size=3)
+    return (default_c2w @ delta).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,11 @@ import torch
 import robosuite as suite
 from robosuite.wrappers.action_wrapper import wrap_env_action_space
 
-from baseline_common import baseline_arch_name
+from baseline_common import (
+    BASELINE_RECON_TAG,
+    RECON_MODES,
+    baseline_arch_name,
+)
 from baseline_eval import BaselineEvaluator
 from models.baseline import BaselineDiffusionPolicy
 from utils import set_seed
@@ -126,6 +130,13 @@ def main():
         default="spatial_softmax",
         choices=["spatial_softmax", "avgpool"],
     )
+    parser.add_argument(
+        "--recon_mode",
+        type=str,
+        default="auto",
+        choices=["auto", *RECON_MODES],
+        help="reconstruction mode; 'auto' reads it from the checkpoint",
+    )
     parser.add_argument("--save_dir", required=True)
     parser.add_argument("--use_fp16", type=str2bool, default=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -142,11 +153,33 @@ def main():
         args.camera_poses_dir = str((module_root / "camera_poses").resolve())
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    marker = baseline_arch_name(args.baseline_pool)
-    if ckpt.get("baseline_arch") != marker:
+
+    # Resolve the reconstruction mode from the checkpoint.  Older checkpoints
+    # predate the explicit key; their marker has no recon suffix -> "none".
+    saved_marker = ckpt.get("baseline_arch", "")
+    saved_mode = ckpt.get("recon_mode")
+    if saved_mode is None:
+        if BASELINE_RECON_TAG in saved_marker:
+            saved_mode = saved_marker.split(BASELINE_RECON_TAG, 1)[1]
+        else:
+            saved_mode = "none"
+    if saved_mode not in RECON_MODES:
         raise RuntimeError(
-            f"checkpoint arch {ckpt.get('baseline_arch')!r} does not match "
-            f"--baseline_pool {args.baseline_pool!r} (expected {marker!r})"
+            f"checkpoint has unknown recon_mode {saved_mode!r}; "
+            f"expected one of {RECON_MODES}"
+        )
+    if args.recon_mode != "auto" and args.recon_mode != saved_mode:
+        raise RuntimeError(
+            f"--recon_mode {args.recon_mode!r} does not match the checkpoint's "
+            f"{saved_mode!r}"
+        )
+
+    marker = baseline_arch_name(args.baseline_pool, saved_mode)
+    if saved_marker != marker:
+        raise RuntimeError(
+            f"checkpoint arch {saved_marker!r} does not match "
+            f"--baseline_pool {args.baseline_pool!r} with recon_mode "
+            f"{saved_mode!r} (expected {marker!r})"
         )
 
     ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt))
@@ -161,6 +194,8 @@ def main():
         lr=1e-4,
         weight_decay=1e-6,
         baseline_pool=args.baseline_pool,
+        recon_mode=saved_mode,
+        recon_weight=float(ckpt.get("recon_weight", 0.1)),
     )
     policy = BaselineDiffusionPolicy(policy_args).cuda()
     policy.load_state_dict(ckpt["model_state_dict"])
@@ -218,6 +253,7 @@ def main():
             "successes": int(sum(successes)),
             "rate": float(np.mean(successes)) if successes else 0.0,
             "baseline_pool": args.baseline_pool,
+            "recon_mode": saved_mode,
             "eval_num_views": args.eval_num_views,
             "eval_view_sampling": args.eval_view_sampling,
             "eval_pose_seed": args.eval_pose_seed,

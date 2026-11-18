@@ -24,9 +24,13 @@ if POLICY_ROOT not in sys.path:
 from baseline_common import (  # noqa: E402
     BASELINE_ARCH,
     BASELINE_ARCH_AVGPOOL,
+    BASELINE_RECON_TAG,
     EEF_HIST_STEPS,
     OBS_FEATURE_DIM,
     PROPRIO_DIM,
+    RECON_MODES,
+    TARGET_POS_JITTER,
+    TARGET_ROT_JITTER_DEG,
     SpatialSoftmax,
     action_window_indices,
     apply_shared_crop,
@@ -38,10 +42,16 @@ from baseline_common import (  # noqa: E402
     mat_to_rot6d,
     normalize_proprio,
     rot6d_to_mat,
+    sample_target_pose,
     select_eval_pose,
     shared_crop_params,
+    target_pose_rng,
 )
 from models.baseline import BaselineDiffusionPolicy, BaselineEncoder  # noqa: E402
+from models.baseline_recon import (  # noqa: E402
+    PluckerPyramidEncoder,
+    TargetViewReconstructor,
+)
 
 
 def _make_inputs(n_frames, k, seed=0):
@@ -364,6 +374,246 @@ def test_policy_shapes():
         print(f"ok policy train/inference shapes pool={pool}")
 
 
+def _recon_policy(mode):
+    args = SimpleNamespace(
+        action_dim=7,
+        lr=1e-4,
+        weight_decay=1e-6,
+        baseline_pool="spatial_softmax",
+        recon_mode=mode,
+        recon_weight=0.1,
+    )
+    return BaselineDiffusionPolicy(
+        args,
+        down_dims=(32, 64),
+        diffusion_step_embed_dim=32,
+        num_inference_steps=2,
+    ).eval()
+
+
+def _recon_batch():
+    return {
+        "image": torch.rand(1, 1, 1, 9, 256, 256),
+        "proprio": torch.randn(1, 1, PROPRIO_DIM),
+        "eef_hist": torch.randn(1, 1, 1, EEF_HIST_STEPS * 11),
+        "view_mask": torch.ones(1, 1, 1, dtype=torch.bool),
+        "actions": torch.randn(1, 16, 7),
+        "is_pad": torch.zeros(1, 16, dtype=torch.bool),
+        "target_image": torch.rand(1, 3, 128, 128),
+        "target_plucker": torch.randn(1, 6, 256, 256),
+    }
+
+
+def test_target_pose_sampling():
+    default = np.eye(4, dtype=np.float32)
+    default[:3, 3] = [0.1, -0.2, 0.3]
+
+    p1 = sample_target_pose(default, target_pose_rng(0, 0))
+    p2 = sample_target_pose(default, target_pose_rng(0, 0))
+    assert p1.shape == (4, 4)
+    assert np.allclose(p1, p2), "target pose is not deterministic"
+    assert np.allclose(p1[3], [0.0, 0.0, 0.0, 1.0])
+    assert np.allclose(p1[:3, :3] @ p1[:3, :3].T, np.eye(3), atol=1e-5)
+
+    delta = np.linalg.inv(default.astype(np.float64)) @ p1.astype(np.float64)
+    assert np.all(np.abs(delta[:3, 3]) <= TARGET_POS_JITTER + 1e-6)
+    angles = Rotation.from_matrix(delta[:3, :3]).as_euler("xyz", degrees=True)
+    assert np.all(np.abs(angles) <= TARGET_ROT_JITTER_DEG + 1e-6)
+
+    p_other = sample_target_pose(default, target_pose_rng(0, 1))
+    assert not np.allclose(p1, p_other)
+
+    p_zero = sample_target_pose(
+        default, target_pose_rng(0, 0), pos_jitter=0.0, rot_jitter_deg=0.0
+    )
+    assert np.allclose(p_zero, default, atol=1e-6)
+    print("ok target pose sampling")
+
+
+def test_arch_marker_recon():
+    assert set(RECON_MODES) == {
+        "none",
+        "z_only",
+        "single_plucker",
+        "multi_plucker",
+    }
+    assert baseline_arch_name("spatial_softmax") == BASELINE_ARCH
+    assert baseline_arch_name("avgpool", "none") == BASELINE_ARCH_AVGPOOL
+    for mode in ("z_only", "single_plucker", "multi_plucker"):
+        marker = baseline_arch_name("spatial_softmax", mode)
+        assert marker == f"{BASELINE_ARCH}{BASELINE_RECON_TAG}{mode}"
+    try:
+        baseline_arch_name("spatial_softmax", "bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid recon mode accepted")
+    print("ok recon arch markers")
+
+
+def test_plucker_pyramid_shapes():
+    model = PluckerPyramidEncoder().eval()
+    with torch.no_grad():
+        feats = model(torch.randn(2, 6, 256, 256))
+    expected = {
+        "g4": (2, 16, 128, 128),
+        "g3": (2, 32, 64, 64),
+        "g2": (2, 64, 32, 32),
+        "g1": (2, 64, 16, 16),
+    }
+    for key, shape in expected.items():
+        assert feats[key].shape == shape, (key, feats[key].shape)
+        assert torch.isfinite(feats[key]).all()
+    print("ok Plucker pyramid shapes")
+
+
+def test_recon_branch_modes():
+    z = torch.randn(2, 512)
+    plucker = torch.randn(2, 6, 256, 256)
+    for mode in ("z_only", "single_plucker", "multi_plucker"):
+        model = TargetViewReconstructor(mode=mode).eval()
+        with torch.no_grad():
+            out = model(z, None if mode == "z_only" else plucker)
+        assert out.shape == (2, 3, 128, 128), (mode, out.shape)
+        assert torch.isfinite(out).all()
+        assert out.min() >= 0 and out.max() <= 1
+
+    z_model = TargetViewReconstructor(mode="z_only").eval()
+    with torch.no_grad():
+        out_ignored = z_model(z, plucker)
+        out_none = z_model(z, None)
+    assert torch.allclose(out_ignored, out_none)
+
+    for mode in ("single_plucker", "multi_plucker"):
+        model = TargetViewReconstructor(mode=mode).eval()
+        for bad in (None, torch.randn(2, 6, 128, 128)):
+            try:
+                with torch.no_grad():
+                    model(z, bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{mode} accepted a bad Plucker map")
+    print("ok recon branch modes")
+
+
+def test_policy_recon_loss_dict():
+    try:
+        import diffusers  # noqa: F401
+    except ImportError:
+        print("skip recon policy loss: diffusers not installed")
+        return
+
+    for mode in ("z_only", "single_plucker", "multi_plucker"):
+        policy = _recon_policy(mode)
+        data = _recon_batch()
+        if mode == "z_only":
+            data.pop("target_plucker")
+        out = policy(data)
+        for key in ("loss", "loss_diffusion", "loss_recon"):
+            assert key in out, (mode, out.keys())
+            assert out[key].ndim == 0 and torch.isfinite(out[key])
+        assert torch.allclose(
+            out["loss"],
+            out["loss_diffusion"] + 0.1 * out["loss_recon"],
+            atol=1e-5,
+        ), mode
+    print("ok recon policy loss dict")
+
+
+def test_policy_recon_none_ignores_targets():
+    try:
+        import diffusers  # noqa: F401
+    except ImportError:
+        print("skip recon-none policy: diffusers not installed")
+        return
+
+    args = SimpleNamespace(
+        action_dim=7,
+        lr=1e-4,
+        weight_decay=1e-6,
+        baseline_pool="spatial_softmax",
+    )
+    policy = BaselineDiffusionPolicy(
+        args,
+        down_dims=(32, 64),
+        diffusion_step_embed_dim=32,
+        num_inference_steps=2,
+    ).eval()
+    assert not any(k.startswith("recon_branch.") for k in policy.state_dict())
+
+    out = policy(_recon_batch())
+    assert "loss_recon" not in out
+    assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["loss_diffusion"])
+    print("ok recon none ignores targets")
+
+
+def test_policy_inference_unchanged_with_recon():
+    try:
+        import diffusers  # noqa: F401
+    except ImportError:
+        print("skip recon inference: diffusers not installed")
+        return
+
+    policy = _recon_policy("multi_plucker")
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("reconstruction branch called at inference")
+
+    policy.recon_branch.forward = _boom
+    data = _recon_batch()
+    for key in ("actions", "is_pad", "target_image", "target_plucker"):
+        data.pop(key)
+    with torch.no_grad():
+        actions = policy(data)
+    assert actions.shape == (1, 8, 7), actions.shape
+    assert torch.isfinite(actions).all()
+    print("ok recon inference unchanged")
+
+
+def test_recon_cpu_autocast():
+    model = TargetViewReconstructor(mode="multi_plucker").eval()
+    z = torch.randn(1, 512)
+    plucker = torch.randn(1, 6, 256, 256)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(z, plucker)
+    assert out.shape == (1, 3, 128, 128)
+    assert torch.isfinite(out.float()).all()
+    print("ok recon CPU autocast")
+
+
+def test_old_checkpoint_compat():
+    try:
+        import diffusers  # noqa: F401
+    except ImportError:
+        print("skip old checkpoint compat: diffusers not installed")
+        return
+
+    args = SimpleNamespace(
+        action_dim=7,
+        lr=1e-4,
+        weight_decay=1e-6,
+        baseline_pool="spatial_softmax",
+    )
+    source = BaselineDiffusionPolicy(
+        args,
+        down_dims=(32, 64),
+        diffusion_step_embed_dim=32,
+        num_inference_steps=2,
+    )
+    target = BaselineDiffusionPolicy(
+        args,
+        down_dims=(32, 64),
+        diffusion_step_embed_dim=32,
+        num_inference_steps=2,
+    )
+    target.load_state_dict(source.state_dict())  # strict
+    assert not any(k.startswith("recon_branch.") for k in source.state_dict())
+    assert baseline_arch_name("spatial_softmax") == BASELINE_ARCH
+    print("ok old checkpoint compatibility")
+
+
 if __name__ == "__main__":
     assert "robosuite" not in sys.modules, "baseline tests must not import robosuite"
     test_common_geometry()
@@ -382,4 +632,13 @@ if __name__ == "__main__":
     test_masked_view_equivalence()
     test_encoder_cpu_autocast()
     test_policy_shapes()
+    test_target_pose_sampling()
+    test_arch_marker_recon()
+    test_plucker_pyramid_shapes()
+    test_recon_branch_modes()
+    test_policy_recon_loss_dict()
+    test_policy_recon_none_ignores_targets()
+    test_policy_inference_unchanged_with_recon()
+    test_recon_cpu_autocast()
+    test_old_checkpoint_compat()
     print("all baseline tests passed")
