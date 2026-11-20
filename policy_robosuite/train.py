@@ -164,8 +164,13 @@ def main(args, ckpt=None):
                 os.makedirs(eval_save_path, exist_ok=True)
                 evaluator.success_by_seed = {}
             
+                n_eval_episodes = (
+                    args.eval_final_episodes
+                    if epoch > args.eval_start_epoch
+                    else args.eval_episodes
+                )
                 success_rates = []
-                for episode_idx in range(50 if epoch > args.eval_start_epoch else args.eval_episodes):
+                for episode_idx in range(n_eval_episodes):
                     with torch.no_grad():
                         _, success_rate, _ = evaluator.evaluate(
                             policy=policy, 
@@ -332,6 +337,8 @@ if __name__ == '__main__':
     # Evaluation config
     parser.add_argument('--eval_every', type=int, default=1000, help='evaluate every N epochs')
     parser.add_argument('--eval_episodes', type=int, default=10, help='number of evaluation episodes')
+    parser.add_argument('--eval_final_episodes', type=int, default=50,
+                        help='episodes per pose set once epoch > eval_start_epoch')
     parser.add_argument('--eval_max_steps', type=int, default=300, help='max steps per evaluation episode')
     parser.add_argument('--eval_save_n_video', type=int, default=10, help='save the first n videos for each evaluation epoch')
 
